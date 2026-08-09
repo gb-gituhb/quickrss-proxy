@@ -7,6 +7,13 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const JINA_API_KEY = process.env.JINA_API_KEY || '';
 
+// Helper to strip QuickRSS tracking prefixes (e.g., "?step=3,") from incoming URLs
+function sanitizeUrl(rawUrl) {
+    if (!rawUrl) return null;
+    const match = rawUrl.match(/(https?:\/\/[^\s]+)/i);
+    return match ? match[1] : rawUrl;
+}
+
 // Wrap content in Kindle Paperwhite Charis SIL typography
 function buildKindleHTML(title, content) {
     return `<!DOCTYPE html>
@@ -58,7 +65,7 @@ function isValidContent(text) {
     return !errorKeywords.some(keyword => lower.includes(keyword));
 }
 
-// Tier 1: Direct Fetch (6s Timeout - Googlebot Referer + High TTFB Buffer)
+// Tier 1: Direct Fetch (6s Timeout)
 async function fetchDirect(targetUrl) {
     const response = await fetch(targetUrl, {
         headers: {
@@ -85,7 +92,7 @@ async function fetchDirect(targetUrl) {
     return buildKindleHTML(article.title, article.content);
 }
 
-// Tier 2: Live Anti-Bot Middleware (18s Timeout - Generous buffer for JS rendering & Cloudflare)
+// Tier 2: Live Anti-Bot Middleware (18s Timeout)
 async function fetchViaLiveMiddleware(targetUrl) {
     const response = await fetch(`https://r.jina.ai/${targetUrl}`, {
         headers: getJinaHeaders(),
@@ -102,7 +109,7 @@ async function fetchViaLiveMiddleware(targetUrl) {
     return buildKindleHTML(json.data.title || 'Article', htmlContent);
 }
 
-// Tier 3: archive.ph via Middleware (20s Timeout - Maximum buffer for archive redirects & heavy DOM)
+// Tier 3: archive.ph via Middleware (20s Timeout)
 async function fetchViaArchivePh(targetUrl) {
     const archivePhUrl = `https://archive.ph/newest/${targetUrl}`;
     const response = await fetch(`https://r.jina.ai/${archivePhUrl}`, {
@@ -120,7 +127,7 @@ async function fetchViaArchivePh(targetUrl) {
     return buildKindleHTML(json.data.title || 'Archived Article', htmlContent);
 }
 
-// Tier 4: Wayback Machine Fallback (8s Timeout - Generous API check)
+// Tier 4: Wayback Machine Fallback (8s Timeout)
 async function fetchViaWayback(targetUrl) {
     const apiRes = await fetch(`https://archive.org/wayback/available?url=${encodeURIComponent(targetUrl)}`, {
         signal: AbortSignal.timeout(8000)
@@ -134,8 +141,11 @@ async function fetchViaWayback(targetUrl) {
 
 // Extraction Route
 app.get('/extract', async (req, res) => {
-    const targetUrl = req.query.url;
-    if (!targetUrl) return res.status(400).send('Missing url parameter');
+    const rawUrl = req.query.url;
+    if (!rawUrl) return res.status(400).send('Missing url parameter');
+
+    // Clean out QuickRSS prefixes like "?step=3,"
+    const targetUrl = sanitizeUrl(rawUrl);
 
     try {
         return res.send(await fetchDirect(targetUrl));
