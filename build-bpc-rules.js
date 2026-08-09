@@ -13,7 +13,6 @@ async function buildBpcRules() {
     
     let rawText = '';
     
-    // Try primary and fallback mirror URLs
     for (const sourceUrl of BPC_SOURCES) {
         try {
             const res = await fetch(sourceUrl, {
@@ -28,9 +27,7 @@ async function buildBpcRules() {
                 console.log(`Successfully fetched BPC definitions from: ${sourceUrl}`);
                 break;
             }
-        } catch (_) {
-            // Continue to next mirror if attempt fails
-        }
+        } catch (_) {}
     }
 
     if (!rawText) {
@@ -40,7 +37,6 @@ async function buildBpcRules() {
     const compiledRules = {};
 
     if (rawText) {
-        // Extract domain keys and useragent/cookie flags from BPC's JS object syntax
         const domainMatches = rawText.matchAll(/["']([^"']+\.[a-z]{2,})["']\s*:\s*\{([^}]+)\}/gi);
 
         for (const match of domainMatches) {
@@ -67,7 +63,6 @@ async function buildBpcRules() {
         }
     }
 
-    // Default overrides for high-value paywalls
     const baseOverrides = {
         'nytimes.com': { strategy: 'googlebot' },
         'bloomberg.com': { strategy: 'googlebot' },
