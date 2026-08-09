@@ -1,5 +1,5 @@
 const express = require('express');
-const { JSDOM } = require('jsdom');
+const { parseHTML } = require('linkedom');
 const { Readability } = require('@mozilla/readability');
 const { marked } = require('marked');
 const path = require('path');
@@ -70,7 +70,7 @@ function getJinaHeaders() {
  */
 function isValidContent(htmlStr) {
   if (!htmlStr || typeof htmlStr !== 'string') return false;
-  const dom = new JSDOM(htmlStr);
+  const dom = parseHTML(`<div>${htmlStr}</div>`);
   const text = dom.window.document.body.textContent || '';
   return text.trim().length > 200;
 }
@@ -79,7 +79,7 @@ function isValidContent(htmlStr) {
  * Generates formatted HTML output optimized for Kindle devices.
  */
 function buildKindleHTML(title, bodyHtml, sourceUrl, stripImages = false) {
-  const dom = new JSDOM(bodyHtml);
+  const dom = parseHTML(`<div>${bodyHtml}</div>`);
   const doc = dom.window.document;
 
   if (stripImages) {
@@ -146,8 +146,16 @@ async function fetchViaScrapeReadability(targetUrl, parentSignal, stripImages = 
   if (!response.ok) throw new Error(`Direct scrape HTTP ${response.status}`);
 
   const htmlText = await response.text();
-  const dom = new JSDOM(htmlText, { url: targetUrl });
-  const reader = new Readability(dom.window.document);
+  const dom = parseHTML(htmlText);
+  const doc = dom.window.document;
+
+  if (doc.head) {
+    const base = doc.createElement('base');
+    base.href = targetUrl;
+    doc.head.appendChild(base);
+  }
+
+  const reader = new Readability(doc);
   const article = reader.parse();
 
   if (!article || !isValidContent(article.content)) {
