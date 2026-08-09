@@ -1,3 +1,4 @@
+// build-bpc-rules.js
 const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
@@ -14,11 +15,11 @@ if (!fs.existsSync(sitesJsPath)) {
 try {
   let code = fs.readFileSync(sitesJsPath, 'utf-8');
 
-  // Strip CommonJS/ESM export wrappers if present in modern forks
+  // Strip CommonJS/ESM export wrappers
   code = code.replace(/export\s+default\s+/, 'var defaultSites = ');
   code = code.replace(/module\.exports\s*=\s*/, 'var defaultSites = ');
 
-  // Expanded browser environment stubs with circular global references
+  // Browser environment stubs with circular global references
   const sandbox = {
     document: {},
     location: { href: '', hostname: '' },
@@ -39,7 +40,6 @@ try {
 
   const context = vm.createContext(sandbox);
 
-  // Wrap code block to capture top-level let/const/var bindings in local lexical scope
   const wrappedCode = `
     ${code};
     ({
@@ -57,32 +57,59 @@ try {
   const sitesMap = {};
 
   for (const [siteKey, config] of Object.entries(rawSites)) {
-    if (!config || typeof config !== 'object') continue;
+    if (!config) continue;
 
     let domainList = [];
-    if (config.domain) {
-      domainList = Array.isArray(config.domain) ? config.domain : [config.domain];
-    } else if (/^[a-z0-9-]+\.[a-z]{2,}$/i.test(siteKey)) {
-      domainList = [siteKey];
+    let isArchive = siteKey.toLowerCase().includes('archive') || siteKey.toLowerCase().includes('wayback') || siteKey.toLowerCase().includes('archive.is');
+    let useragent = null;
+    let referer = null;
+    let stripImages = false;
+    let timeoutMs = null;
+
+    // Support string key-value mappings (e.g., "Site Title": "domain.com")
+    if (typeof config === 'string') {
+      const domStr = config.trim();
+      if (!domStr.startsWith('###')) {
+        domainList = [domStr];
+        if (domStr.toLowerCase().includes('archive') || domStr.toLowerCase().includes('wayback')) {
+          isArchive = true;
+        }
+      }
+    } 
+    // Support object key-value mappings (e.g., "Site Title": { domain: "domain.com", ... })
+    else if (typeof config === 'object') {
+      if (config.domain) {
+        domainList = Array.isArray(config.domain) ? config.domain : [config.domain];
+      } else if (/^[a-z0-9-]+\.[a-z]{2,}$/i.test(siteKey)) {
+        domainList = [siteKey];
+      }
+
+      const configStr = JSON.stringify(config).toLowerCase();
+      if (configStr.includes('archive') || configStr.includes('wayback')) {
+        isArchive = true;
+      }
+
+      useragent = config.useragent || config.useragent_custom || null;
+      referer = config.referer || null;
+      stripImages = Boolean(config.strip_images || config.no_images);
+      timeoutMs = config.timeout || null;
     }
 
     for (const rawDom of domainList) {
       const dom = String(rawDom).toLowerCase().replace(/^www\./, '').trim();
-      if (!dom || dom.endsWith('.js') || dom.endsWith('.json')) continue;
+      if (!dom || dom.endsWith('.js') || dom.endsWith('.json') || dom.startsWith('###')) continue;
 
       extractedDomains.add(dom);
-
-      const configStr = JSON.stringify(config).toLowerCase();
-      if (configStr.includes('archive') || configStr.includes('wayback')) {
+      if (isArchive) {
         extractedArchiveDomains.add(dom);
       }
 
       sitesMap[dom] = {
         domain: dom,
-        useragent: config.useragent || config.useragent_custom || null,
-        referer: config.referer || null,
-        stripImages: Boolean(config.strip_images || config.no_images),
-        timeoutMs: config.timeout || null
+        useragent,
+        referer,
+        stripImages,
+        timeoutMs
       };
     }
   }
