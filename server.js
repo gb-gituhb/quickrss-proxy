@@ -7,21 +7,9 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const JINA_API_KEY = process.env.JINA_API_KEY || '';
 
-// Domains known to break Mozilla Readability (forces instant failover to Tier 2 Jina)
-const BYPASS_READABILITY_DOMAINS = [
-    'bbc.com',
-    'bbc.co.uk',
-    'theguardian.com',
-    'medium.com',
-    'bloomberg.com',
-    'nytimes.com',
-    'wsj.com'
-];
-
 // Clean out QuickRSS tracking prefixes, trailing quotes, and extract valid URLs
 function sanitizeUrl(rawUrl) {
     if (!rawUrl) return null;
-    
     let urlString = Array.isArray(rawUrl) ? String(rawUrl[rawUrl.length - 1]) : String(rawUrl);
     urlString = urlString.trim().replace(/^['"]|['"]$/g, '');
 
@@ -39,7 +27,6 @@ function sanitizeImages(htmlContent, targetUrl) {
         const imgs = doc.querySelectorAll('img');
 
         imgs.forEach(img => {
-            // 1. Swap lazy-load attributes to src if src is missing or a placeholder/data URI
             const realSrc = img.getAttribute('data-src') || 
                             img.getAttribute('data-original') || 
                             img.getAttribute('data-lazy-src') || 
@@ -50,7 +37,6 @@ function sanitizeImages(htmlContent, targetUrl) {
                 return;
             }
 
-            // 2. Strip 1x1 tracking pixels that stall Kindle downloads
             const width = img.getAttribute('width');
             const height = img.getAttribute('height');
             if ((width === '1' || width === '0') && (height === '1' || height === '0')) {
@@ -58,7 +44,6 @@ function sanitizeImages(htmlContent, targetUrl) {
                 return;
             }
 
-            // 3. Resolve absolute URL for relative paths (/img.jpg, ./img.jpg, //cdn.com/img.jpg)
             try {
                 const absUrl = new URL(realSrc, targetUrl).href;
                 img.setAttribute('src', absUrl);
@@ -67,11 +52,10 @@ function sanitizeImages(htmlContent, targetUrl) {
                 return;
             }
 
-            // 4. Remove attributes that cause Kindle cURL stalls
             img.removeAttribute('data-src');
             img.removeAttribute('data-original');
             img.removeAttribute('data-lazy-src');
-            img.removeAttribute('srcset'); // Removes multi-resolution duplicate downloads
+            img.removeAttribute('srcset');
         });
 
         return doc.body.firstElementChild ? doc.body.firstElementChild.innerHTML : htmlContent;
@@ -80,7 +64,6 @@ function sanitizeImages(htmlContent, targetUrl) {
     }
 }
 
-// Wrap content in Kindle Paperwhite Charis SIL typography
 function buildKindleHTML(title, content, targetUrl = '') {
     const cleanedContent = targetUrl ? sanitizeImages(content, targetUrl) : content;
     return `<!DOCTYPE html>
@@ -90,10 +73,7 @@ function buildKindleHTML(title, content, targetUrl = '') {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>${title || 'Article'}</title>
     <style>
-        @font-face {
-            font-family: 'Charis SIL';
-            src: local('Charis SIL');
-        }
+        @font-face { font-family: 'Charis SIL'; src: local('Charis SIL'); }
         body {
             font-family: 'Charis SIL', Georgia, serif;
             line-height: 1.6;
@@ -120,22 +100,19 @@ function buildKindleHTML(title, content, targetUrl = '') {
 }
 
 function getJinaHeaders() {
-    const headers = { 
-        'Accept': 'application/json',
-        'X-No-Cache': 'true'
-    };
+    const headers = { 'Accept': 'application/json', 'X-No-Cache': 'true' };
     if (JINA_API_KEY) headers['Authorization'] = `Bearer ${JINA_API_KEY}`;
     return headers;
 }
 
+// Universal Content Quality Gate (Works across ALL domains dynamically)
 function isValidContent(htmlContent) {
     if (!htmlContent) return false;
 
-    // Convert HTML to plain text for word/character validation
     const plainText = htmlContent.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
     const lower = plainText.toLowerCase();
     
-    // 1. Hard bot-blocker errors
+    // 1. Rejects anti-bot error pages
     const hardErrors = [
         'captcha', 'enable javascript', 'access denied', 
         'security check', 'just a moment...', 'pardon our interruption',
@@ -145,37 +122,32 @@ function isValidContent(htmlContent) {
         return false;
     }
 
-    // 2. Truncation, teaser, & paywall phrases
+    // 2. Rejects truncation & paywall teasers
     const truncationMarkers = [
         'continue reading', 'read full story', 'read full article', 
         'read the full article', 'keep reading', 'subscribe to read', 
         'no snapshot', 'create an account to read', 'log in to read', 
-        'sign in to continue', 'register to read', 'read more'
+        'sign in to continue', 'register to read'
     ];
 
     if (truncationMarkers.some(keyword => lower.includes(keyword)) && plainText.length < 3000) {
         return false;
     }
 
-    // 3. Strict Paragraph & Word Count Guard
-    // Rejects 1-line BBC/RSS teasers and forces failover to Tier 2 (Jina)
-    const paragraphCount = (htmlContent.match(/<p[\s>]/gi) || []).length;
+    // 3. Universal Word & Paragraph Threshold
+    // Real articles are almost never under 180 words or fewer than 2 paragraphs.
     const wordCount = plainText.split(/\s+/).filter(Boolean).length;
+    const paragraphCount = (htmlContent.match(/<p[\s>]/gi) || []).length;
 
-    if (paragraphCount < 2 || wordCount < 120) {
+    if (wordCount < 180 || paragraphCount < 2) {
         return false;
     }
 
     return true;
 }
 
-// Tier 1: Direct Fetch (5s Timeout)
+// Tier 1: Direct Fetch (3s Snappy Timeout)
 async function fetchDirect(targetUrl) {
-    // Instant failover for domains known to break Mozilla Readability
-    if (BYPASS_READABILITY_DOMAINS.some(domain => targetUrl.toLowerCase().includes(domain))) {
-        throw new Error(`Domain in bypass list (${targetUrl}); routing directly to Tier 2 (Jina)`);
-    }
-
     const response = await fetch(targetUrl, {
         headers: {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -183,20 +155,14 @@ async function fetchDirect(targetUrl) {
             'Accept-Language': 'en-US,en;q=0.5',
             'Referer': 'https://www.google.com/'
         },
-        signal: AbortSignal.timeout(5000)
+        signal: AbortSignal.timeout(3000)
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const html = await response.text();
 
-    if (!html || html.trim().length < 200) {
-        throw new Error('Received empty or invalid HTML payload');
-    }
-
     const dom = parseHTML(html);
     const doc = dom?.window?.document;
-    if (!doc || !doc.documentElement) {
-        throw new Error('Failed to parse valid DOM structure');
-    }
+    if (!doc || !doc.documentElement) throw new Error('Invalid DOM structure');
 
     if (doc.head) {
         const base = doc.createElement('base');
@@ -208,7 +174,7 @@ async function fetchDirect(targetUrl) {
     const article = reader.parse();
 
     if (!article || !article.content || !isValidContent(article.content)) {
-        throw new Error('Direct fetch content invalid, truncated, or paywalled');
+        throw new Error('Tier 1 content invalid or incomplete (triggered quality gate)');
     }
     return buildKindleHTML(article.title, article.content, targetUrl);
 }
@@ -253,10 +219,7 @@ async function fetchViaWayback(targetUrl) {
     const apiRes = await fetch(`https://archive.org/wayback/available?url=${encodeURIComponent(targetUrl)}`, {
         signal: AbortSignal.timeout(5000)
     });
-    
     if (!apiRes.ok) throw new Error(`Wayback API HTTP ${apiRes.status}`);
-    const contentType = apiRes.headers.get('content-type') || '';
-    if (!contentType.includes('json')) throw new Error('Wayback API returned non-JSON payload');
 
     const apiData = await apiRes.json();
     const snapshotUrl = apiData?.archived_snapshots?.closest?.url;
@@ -265,10 +228,8 @@ async function fetchViaWayback(targetUrl) {
     return await fetchDirect(snapshotUrl);
 }
 
-// Health Check Route (kept warm by pings)
-app.get('/health', (req, res) => {
-    res.status(200).send('OK');
-});
+// Health Check Route
+app.get('/health', (req, res) => res.status(200).send('OK'));
 
 // Main Extraction Route
 app.get('/extract', async (req, res) => {
@@ -276,34 +237,31 @@ app.get('/extract', async (req, res) => {
     if (!rawUrl) return res.status(400).send('Missing url parameter');
 
     const targetUrl = sanitizeUrl(rawUrl);
-
-    if (!targetUrl) {
-        return res.status(400).send('Invalid or malformed URL provided.');
-    }
+    if (!targetUrl) return res.status(400).send('Invalid URL provided.');
 
     try {
         return res.send(await fetchDirect(targetUrl));
     } catch (e1) {
-        console.warn(`[Tier 1 Failed] ${targetUrl}: ${e1.message}. Trying Tier 2 (Live Jina)...`);
+        console.warn(`[Tier 1 Failed] ${targetUrl}: ${e1.message}. Falling over to Tier 2 (Jina)...`);
     }
 
     try {
         return res.send(await fetchViaLiveMiddleware(targetUrl));
     } catch (e2) {
-        console.warn(`[Tier 2 Failed] ${targetUrl}: ${e2.message}. Trying Tier 3 (archive.ph)...`);
+        console.warn(`[Tier 2 Failed] ${targetUrl}: ${e2.message}. Falling over to Tier 3 (archive.ph)...`);
     }
 
     try {
         return res.send(await fetchViaArchivePh(targetUrl));
     } catch (e3) {
-        console.warn(`[Tier 3 Failed] ${targetUrl}: ${e3.message}. Trying Tier 4 (Wayback)...`);
+        console.warn(`[Tier 3 Failed] ${targetUrl}: ${e3.message}. Falling over to Tier 4 (Wayback)...`);
     }
 
     try {
         return res.send(await fetchViaWayback(targetUrl));
     } catch (e4) {
         console.error(`[Tier 4 Failed] ${targetUrl}: ${e4.message}`);
-        return res.status(500).send('Failed to extract article content across all pipelines.');
+        return res.status(500).send('Failed to extract content across all tiers.');
     }
 });
 
