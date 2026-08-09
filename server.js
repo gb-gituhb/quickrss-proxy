@@ -8,7 +8,6 @@ const PORT = process.env.PORT || 3000;
 const JINA_API_KEY = process.env.JINA_API_KEY || '';
 const AUTH_TOKEN = process.env.AUTH_TOKEN || '';
 
-// In-memory LRU Cache Implementation
 class SimpleLRUCache {
     constructor(limit = 200, ttlMs = 60 * 60 * 1000) {
         this.limit = limit;
@@ -38,14 +37,12 @@ class SimpleLRUCache {
     }
 }
 
-// Caches: 200 articles (1-hr TTL), 100 failed URLs (5-min TTL)
 const articleCache = new SimpleLRUCache(200, 60 * 60 * 1000);
 const errorCache = new SimpleLRUCache(100, 5 * 60 * 1000);
 
-// Basic Authentication Middleware
 app.use((req, res, next) => {
     if (req.path === '/health') return next();
-    if (!AUTH_TOKEN) return next(); // Bypassed if AUTH_TOKEN environment variable is not set
+    if (!AUTH_TOKEN) return next();
 
     const token = req.headers['x-auth-token'] || req.query.token;
     if (token !== AUTH_TOKEN) {
@@ -54,7 +51,6 @@ app.use((req, res, next) => {
     next();
 });
 
-// Escape HTML special characters for titles
 function escapeHtml(str) {
     if (!str) return '';
     return String(str)
@@ -65,7 +61,6 @@ function escapeHtml(str) {
         .replace(/'/g, '&#39;');
 }
 
-// Clean tracking prefixes, handle parentheses in URLs, and validate with native URL parser
 function sanitizeUrl(rawUrl) {
     if (!rawUrl) return null;
     let urlString = Array.isArray(rawUrl) ? String(rawUrl[rawUrl.length - 1]) : String(rawUrl);
@@ -90,15 +85,35 @@ function sanitizeUrl(rawUrl) {
     return null;
 }
 
-// DOM-based image sanitizer with explicit DOM memory cleanup
-function sanitizeImages(htmlContent, targetUrl) {
+// Detects raw HTML that is just a Client-Side Rendering (SPA) app shell or noscript block
+function isJsAppShell(rawHtml) {
+    if (!rawHtml) return true;
+    const stripped = rawHtml
+        .replace(/<script[\s\S]*?<\/script>/gi, '')
+        .replace(/<style[\s\S]*?<\/style>/gi, '')
+        .replace(/<svg[\s\S]*?<\/svg>/gi, '');
+
+    const bodyMatch = stripped.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
+    const bodyContent = bodyMatch ? bodyMatch[1] : stripped;
+    const textOnly = bodyContent.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+
+    return textOnly.length < 150;
+}
+
+// Cleans inline styles (prevents scaling issues) and updates image links
+function sanitizeContent(htmlContent, targetUrl) {
     if (!htmlContent) return '';
     let dom = null;
     try {
         dom = parseHTML(`<div>${htmlContent}</div>`);
         const doc = dom.window.document;
-        const imgs = doc.querySelectorAll('img');
 
+        // Remove inline styles that break E-ink layout/fonts
+        const styledElements = doc.querySelectorAll('[style]');
+        styledElements.forEach(el => el.removeAttribute('style'));
+
+        // Fix image paths
+        const imgs = doc.querySelectorAll('img');
         imgs.forEach(img => {
             const realSrc = img.getAttribute('data-src') || 
                             img.getAttribute('data-original') || 
@@ -143,32 +158,34 @@ function sanitizeImages(htmlContent, targetUrl) {
 }
 
 function buildKindleHTML(title, content, targetUrl = '') {
-    const cleanedContent = targetUrl ? sanitizeImages(content, targetUrl) : content;
+    const cleanedContent = targetUrl ? sanitizeContent(content, targetUrl) : content;
     const safeTitle = escapeHtml(title || 'Untitled');
 
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
     <title>${safeTitle}</title>
     <style>
         @font-face { font-family: 'Charis SIL'; src: local('Charis SIL'); }
+        html { font-size: 18px; }
         body {
             font-family: 'Charis SIL', Georgia, serif;
             line-height: 1.6;
             color: #000;
             background-color: #fff;
             margin: 0 auto;
-            max-width: 680px;
-            padding: 15px;
-            font-size: 1.1em;
+            padding: 12px;
+            font-size: 1rem;
+            word-wrap: break-word;
         }
-        h1 { font-size: 1.7em; margin-bottom: 0.2em; }
-        img { max-width: 100%; height: auto; display: block; margin: 15px auto; }
-        p { margin-bottom: 1.2em; text-align: justify; }
+        h1 { font-size: 1.6rem; line-height: 1.3; margin-bottom: 0.4rem; }
+        img { max-width: 100% !important; height: auto !important; display: block; margin: 15px auto; }
+        p { margin-bottom: 1.2rem; text-align: justify; font-size: 1rem; }
         a { color: #000; text-decoration: underline; }
-        blockquote { border-left: 3px solid #000; padding-left: 10px; margin-left: 0; }
+        blockquote { border-left: 3px solid #000; padding-left: 12px; margin-left: 0; }
+        pre, code { font-family: monospace; font-size: 0.9rem; white-space: pre-wrap; }
     </style>
 </head>
 <body>
@@ -185,7 +202,6 @@ function getJinaHeaders() {
     return headers;
 }
 
-// Combines tier timeout with route-level parent AbortSignal
 function getCombinedSignal(timeoutMs, parentSignal) {
     const timeoutSignal = AbortSignal.timeout(timeoutMs);
     if (!parentSignal) return timeoutSignal;
@@ -195,7 +211,7 @@ function getCombinedSignal(timeoutMs, parentSignal) {
     return timeoutSignal;
 }
 
-// Universal Content Quality Gate with sliced scanning window
+// Universal Content Quality Gate
 function isValidContent(htmlContent) {
     if (!htmlContent) return false;
 
@@ -203,7 +219,7 @@ function isValidContent(htmlContent) {
     const plainText = scanWindow.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
     const lower = plainText.toLowerCase();
     
-    // 1. Rejects anti-bot error pages
+    // 1. Anti-bot / Captcha rejection
     const hardErrors = [
         'captcha', 'enable javascript', 'access denied', 
         'security check', 'just a moment...', 'pardon our interruption',
@@ -213,26 +229,25 @@ function isValidContent(htmlContent) {
         return false;
     }
 
-    // 2. Rejects truncation & paywall teasers
+    // 2. Truncation & Paywall Teaser Detection (< 800 words with trigger phrases)
+    const wordCount = plainText.split(/\s+/).filter(Boolean).length;
     const truncationMarkers = [
         'continue reading', 'read full story', 'read full article', 
         'read the full article', 'keep reading', 'subscribe to read', 
-        'no snapshot', 'create an account to read', 'log in to read', 
+        'create an account to read', 'log in to read', 
         'sign in to continue', 'register to read'
     ];
 
-    if (truncationMarkers.some(keyword => lower.includes(keyword)) && plainText.length < 3000) {
+    if (truncationMarkers.some(keyword => lower.includes(keyword)) && wordCount < 800) {
         return false;
     }
 
-    // 3. Word & Paragraph Threshold
-    const wordCount = plainText.split(/\s+/).filter(Boolean).length;
+    // 3. Absolute Minimum Word Threshold (300 words)
     const paragraphCount = (scanWindow.match(/<p[\s>]/gi) || []).length;
-
-    return !(wordCount < 180 || paragraphCount < 2);
+    return !(wordCount < 300 || paragraphCount < 2);
 }
 
-// Tier 1: Direct Fetch (2.5s Timeout)
+// Tier 1: Direct Fetch
 async function fetchDirect(targetUrl, parentSignal) {
     let dom = null;
     try {
@@ -240,13 +255,17 @@ async function fetchDirect(targetUrl, parentSignal) {
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.5',
-                'Referer': 'https://www.google.com/'
+                'Accept-Language': 'en-US,en;q=0.5'
             },
             signal: getCombinedSignal(2500, parentSignal)
         });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const html = await response.text();
+
+        // Immediately throw if the raw payload is an unrendered JS app shell
+        if (isJsAppShell(html)) {
+            throw new Error('Raw HTML is an unrendered JS application shell');
+        }
 
         dom = parseHTML(html);
         const doc = dom?.window?.document;
@@ -273,11 +292,11 @@ async function fetchDirect(targetUrl, parentSignal) {
     }
 }
 
-// Tier 2: Live Anti-Bot Middleware (6s Timeout)
+// Tier 2: Jina AI Middleware
 async function fetchViaLiveMiddleware(targetUrl, parentSignal) {
     const response = await fetch(`https://r.jina.ai/${targetUrl}`, {
         headers: getJinaHeaders(),
-        signal: getCombinedSignal(6000, parentSignal)
+        signal: getCombinedSignal(6500, parentSignal)
     });
     if (!response.ok) throw new Error(`Jina Live HTTP ${response.status}`);
     
@@ -290,7 +309,7 @@ async function fetchViaLiveMiddleware(targetUrl, parentSignal) {
     return buildKindleHTML(json.data.title || 'Article', htmlContent, targetUrl);
 }
 
-// Tier 3: archive.ph via Middleware (7s Timeout)
+// Tier 3: archive.ph
 async function fetchViaArchivePh(targetUrl, parentSignal) {
     const archivePhUrl = `https://archive.ph/newest/${targetUrl}`;
     const response = await fetch(`https://r.jina.ai/${archivePhUrl}`, {
@@ -308,7 +327,7 @@ async function fetchViaArchivePh(targetUrl, parentSignal) {
     return buildKindleHTML(json.data.title || 'Archived Article', htmlContent, targetUrl);
 }
 
-// Tier 4: Wayback Machine Fallback (4s Timeout)
+// Tier 4: Wayback Machine
 async function fetchViaWayback(targetUrl, parentSignal) {
     const apiRes = await fetch(`https://archive.org/wayback/available?url=${encodeURIComponent(targetUrl)}`, {
         signal: getCombinedSignal(4000, parentSignal)
@@ -322,18 +341,18 @@ async function fetchViaWayback(targetUrl, parentSignal) {
     return await fetchDirect(snapshotUrl, parentSignal);
 }
 
-// Pipeline Execution
+// Pipeline Execution (Universal Order)
 async function executePipeline(targetUrl, signal) {
     const cachedHtml = articleCache.get(targetUrl);
-    if (cachedHtml) {
-        return cachedHtml;
-    }
+    if (cachedHtml) return cachedHtml;
 
     if (errorCache.get(targetUrl)) {
         throw new Error('Recent extraction failure (cached error)');
     }
 
-    for (const tierFn of [fetchDirect, fetchViaLiveMiddleware, fetchViaArchivePh, fetchViaWayback]) {
+    const pipeline = [fetchDirect, fetchViaLiveMiddleware, fetchViaArchivePh, fetchViaWayback];
+
+    for (const tierFn of pipeline) {
         try {
             if (signal?.aborted) break;
             const html = await tierFn(targetUrl, signal);
@@ -348,10 +367,8 @@ async function executePipeline(targetUrl, signal) {
     throw new Error('Failed to extract article content across all pipelines.');
 }
 
-// Health Check Route
 app.get('/health', (req, res) => res.status(200).send('OK'));
 
-// Main Extraction Route
 app.get('/extract', async (req, res) => {
     res.set('Content-Type', 'text/html; charset=utf-8');
 
@@ -362,17 +379,15 @@ app.get('/extract', async (req, res) => {
     if (!targetUrl) return res.status(400).send('Invalid URL provided.');
 
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15000); // 15s global ceiling
+    const timeout = setTimeout(() => controller.abort(), 16000);
 
     try {
         const result = await executePipeline(targetUrl, controller.signal);
         return res.send(result);
     } catch (err) {
         if (controller.signal.aborted) {
-            console.error(`[Extraction Timeout] ${targetUrl}`);
             return res.status(504).send('Extraction timed out.');
         }
-        console.error(`[Extraction Failed] ${targetUrl}: ${err.message}`);
         return res.status(500).send('Failed to extract content across all tiers.');
     } finally {
         clearTimeout(timeout);
