@@ -7,11 +7,15 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const JINA_API_KEY = process.env.JINA_API_KEY || '';
 
-// Helper to strip QuickRSS tracking prefixes (e.g., "?step=3,") from incoming URLs
+// Helper to strip QuickRSS tracking prefixes (e.g., "?step=3,") and safely handle non-string query inputs
 function sanitizeUrl(rawUrl) {
     if (!rawUrl) return null;
-    const match = rawUrl.match(/(https?:\/\/[^\s]+)/i);
-    return match ? match[1] : rawUrl;
+    
+    // If Express parses multiple url parameters into an Array, take the last element; otherwise cast to String
+    const urlString = Array.isArray(rawUrl) ? String(rawUrl[rawUrl.length - 1]) : String(rawUrl);
+    
+    const match = urlString.match(/(https?:\/\/[^\s]+)/i);
+    return match ? match[1] : urlString;
 }
 
 // Wrap content in Kindle Paperwhite Charis SIL typography
@@ -144,7 +148,7 @@ app.get('/extract', async (req, res) => {
     const rawUrl = req.query.url;
     if (!rawUrl) return res.status(400).send('Missing url parameter');
 
-    // Clean out QuickRSS prefixes like "?step=3,"
+    // Clean out QuickRSS prefixes like "?step=3," and safely process arrays/objects
     const targetUrl = sanitizeUrl(rawUrl);
 
     try {
