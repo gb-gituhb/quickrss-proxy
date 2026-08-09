@@ -1,103 +1,84 @@
 const express = require('express');
-const puppeteer = require('puppeteer');
 const cheerio = require('cheerio');
-const path = require('path');
-const fs = require('fs');
 
 const app = express();
-const PORT = process.env.PORT || 8080;
-const BPC_PATH = path.join(__dirname, 'bpc-extension');
+const PORT = process.env.PORT || 10000;
 
 function cleanHtml(html) {
+  if (!html) return null;
   const $ = cheerio.load(html);
-  $('script, style, nav, footer, iframe, header, form, svg, noscript, .ad, .advertisement, [id*="cookie"], [class*="cookie"]').remove();
+  $('script, style, nav, footer, iframe, header, form, svg, noscript, .ad, .advertisement, [id*="cookie"], [class*="cookie"], [class*="paywall"]').remove();
   return $.html();
 }
 
-async function extractWithPuppeteer(url) {
-  const hasBpc = fs.existsSync(BPC_PATH);
-  const launchArgs = [
-    '--no-sandbox',
-    '--disable-setuid-sandbox',
-    '--disable-dev-shm-usage',
-    '--disable-gpu',
-    '--no-first-run',
-    '--no-zygote',
-    '--single-process'
-  ];
-
-  if (hasBpc) {
-    launchArgs.push(`--disable-extensions-except=${BPC_PATH}`);
-    launchArgs.push(`--load-extension=${BPC_PATH}`);
-  }
-
-  const browser = await puppeteer.launch({
-    executablePath: process.env.PUPPETEER_EXEC_PATH || undefined,
-    headless: 'new',
-    args: launchArgs
-  });
-
+// Stage 1: Direct Fetch with browser headers
+async function extractDirect(url) {
   try {
-    const page = await browser.newPage();
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36');
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 });
-    await new Promise(resolve => setTimeout(resolve, 2000));
-
-    const content = await page.content();
-    await browser.close();
-
-    const lowered = content.toLowerCase();
-    const isPaywalled = lowered.includes('subscribe_wall') || 
-                        lowered.includes('paywall') || 
-                        lowered.includes('register to read') || 
-                        lowered.includes('access-restricted');
-
-    if (content.length > 2500 && !isPaywalled) {
-      return cleanHtml(content);
-    }
-  } catch (err) {
-    console.error('Puppeteer Stage Error:', err.message);
-    await browser.close();
-  }
-  return null;
-}
-
-async function extractArchive(url) {
-  const archiveUrl = `https://archive.ph/newest/${url}`;
-  const browser = await puppeteer.launch({
-    executablePath: process.env.PUPPETEER_EXEC_PATH || undefined,
-    headless: 'new',
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-  });
-
-  try {
-    const page = await browser.newPage();
-    await page.goto(archiveUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
-    const content = await page.content();
-    await browser.close();
-
-    if (content && content.length > 1500 && !content.toLowerCase().includes('captcha')) {
-      return cleanHtml(content);
-    }
-  } catch (err) {
-    console.error('Archive Stage Error:', err.message);
-    await browser.close();
-  }
-  return null;
-}
-
-async function extractMorss(url) {
-  try {
-    const response = await fetch(`https://morss.it/${url}`);
+    const response = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9'
+      },
+      signal: AbortSignal.timeout(8000)
+    });
     if (response.ok) {
       const text = await response.text();
-      return cleanHtml(text);
+      const cleaned = cleanHtml(text);
+      const lowered = text.toLowerCase();
+      const isPaywalled = lowered.includes('subscribe_wall') || 
+                          lowered.includes('paywall') || 
+                          lowered.includes('register to read');
+      if (cleaned && cleaned.length > 1000 && !isPaywalled) {
+        return cleaned;
+      }
     }
   } catch (err) {
-    console.error('Morss Stage Error:', err.message);
+    console.error('Direct stage error:', err.message);
   }
   return null;
 }
+
+// Stage 2: Archive.ph bypass
+async function extractArchive(url) {
+  try {
+    const response = await fetch(`https://archive.ph/newest/${url}`, {
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+      signal: AbortSignal.timeout(10000)
+    });
+    if (response.ok) {
+      const text = await response.text();
+      if (text && text.length > 1500 && !text.toLowerCase().includes('captcha')) {
+        return cleanHtml(text);
+      }
+    }
+  } catch (err) {
+    console.error('Archive stage error:', err.message);
+  }
+  return null;
+}
+
+// Stage 3: Morss RSS extractor
+async function extractMorss(url) {
+  try {
+    const response = await fetch(`https://morss.it/${url}`, {
+      signal: AbortSignal.timeout(10000)
+    });
+    if (response.ok) {
+      const text = await response.text();
+      if (text && text.length > 500) {
+        return cleanHtml(text);
+      }
+    }
+  } catch (err) {
+    console.error('Morss stage error:', err.message);
+  }
+  return null;
+}
+
+app.get('/', (req, res) => {
+  res.send('QuickRSS BPC Proxy is Running. Usage: /extract?url=HTTPS_ARTICLE_URL');
+});
 
 app.get('/extract', async (req, res) => {
   const targetUrl = req.query.url;
@@ -107,16 +88,16 @@ app.get('/extract', async (req, res) => {
 
   console.log(`Extracting: ${targetUrl}`);
 
-  let html = await extractWithPuppeteer(targetUrl);
+  let html = await extractDirect(targetUrl);
   if (html) {
-    console.log('Stage 1 (BPC) succeeded');
+    console.log('Stage 1 (Direct) succeeded');
     return res.setHeader('Content-Type', 'text/html').send(html);
   }
 
   console.log('Stage 1 failed. Attempting Stage 2 (Archive.ph)...');
   html = await extractArchive(targetUrl);
   if (html) {
-    console.log('Stage 2 (Archive.ph) succeeded');
+    console.log('Stage 2 (Archive) succeeded');
     return res.setHeader('Content-Type', 'text/html').send(html);
   }
 
@@ -130,6 +111,6 @@ app.get('/extract', async (req, res) => {
   return res.status(500).send('Extraction failed across all stages.');
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`BPC Cloud Proxy listening on port ${PORT}`);
 });
