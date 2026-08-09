@@ -1,19 +1,40 @@
 const fs = require('fs');
 const path = require('path');
 
-const BPC_RAW_URL = 'https://raw.githubusercontent.com/bpc-clone/bpc-rules/main/sites.js';
+// Primary and mirror URLs for upstream BPC site definitions
+const BPC_SOURCES = [
+    'https://raw.githubusercontent.com/bpc-clone/bpc_updates/main/sites.js',
+    'https://gitlab.com/bypassedws/bypass-paywalls-clean-filters/-/raw/main/sites.js',
+    'https://raw.githubusercontent.com/bpc-clone/bpc-rules/main/sites.js'
+];
 
 async function buildBpcRules() {
     console.log('Fetching upstream BPC site definitions...');
     
     let rawText = '';
-    try {
-        const res = await fetch(BPC_RAW_URL);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        rawText = await res.text();
-    } catch (err) {
-        console.warn('Failed to fetch remote BPC rules, using fallback base dataset...');
-        rawText = '';
+    
+    // Try primary and fallback mirror URLs
+    for (const sourceUrl of BPC_SOURCES) {
+        try {
+            const res = await fetch(sourceUrl, {
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                    'Accept': 'text/plain, */*'
+                },
+                signal: AbortSignal.timeout(5000)
+            });
+            if (res.ok) {
+                rawText = await res.text();
+                console.log(`Successfully fetched BPC definitions from: ${sourceUrl}`);
+                break;
+            }
+        } catch (_) {
+            // Continue to next mirror if attempt fails
+        }
+    }
+
+    if (!rawText) {
+        console.warn('Failed to fetch remote BPC rules from all mirrors, using fallback dataset...');
     }
 
     const compiledRules = {};
@@ -46,7 +67,7 @@ async function buildBpcRules() {
         }
     }
 
-    // Default overrides for major paywalls
+    // Default overrides for high-value paywalls
     const baseOverrides = {
         'nytimes.com': { strategy: 'googlebot' },
         'bloomberg.com': { strategy: 'googlebot' },
