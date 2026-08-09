@@ -66,7 +66,6 @@ try {
     let stripImages = false;
     let timeoutMs = null;
 
-    // Support string key-value mappings (e.g., "Site Title": "domain.com")
     if (typeof config === 'string') {
       const domStr = config.trim();
       if (!domStr.startsWith('###')) {
@@ -75,9 +74,7 @@ try {
           isArchive = true;
         }
       }
-    } 
-    // Support object key-value mappings (e.g., "Site Title": { domain: "domain.com", ... })
-    else if (typeof config === 'object') {
+    } else if (typeof config === 'object') {
       if (config.domain) {
         domainList = Array.isArray(config.domain) ? config.domain : [config.domain];
       } else if (/^[a-z0-9-]+\.[a-z]{2,}$/i.test(siteKey)) {
