@@ -5,18 +5,16 @@ const vm = require('vm');
 const sitesJsPath = path.join(__dirname, 'sites.js');
 const outputPath = path.join(__dirname, 'bpc-rules.json');
 
-// Graceful fallback if sites.js is not present
 if (!fs.existsSync(sitesJsPath)) {
-  console.warn('[BUILD] sites.js not found in root. Generating minimal fallback bpc-rules.json...');
-  const fallback = { domains: [], archiveDomains: [], sitesMap: {} };
-  fs.writeFileSync(outputPath, JSON.stringify(fallback, null, 2));
+  console.warn('[BUILD] sites.js not found in root. Generating minimal empty bpc-rules.json...');
+  fs.writeFileSync(outputPath, JSON.stringify({ domains: [], archiveDomains: [], sitesMap: {} }, null, 2));
   process.exit(0);
 }
 
 try {
   const code = fs.readFileSync(sitesJsPath, 'utf-8');
 
-  // Construct standard browser sandbox environment required by sites.js
+  // Expanded browser environment stubs to prevent runtime errors in complex BPC forks
   const sandbox = {
     window: {},
     document: {},
@@ -24,16 +22,30 @@ try {
     navigator: { userAgent: 'Mozilla/5.0' },
     chrome: { runtime: { id: 'proxy-build' } },
     browser: { runtime: { id: 'proxy-build' } },
-    console: { log: () => {}, warn: () => {}, error: () => {} }
+    console: { log: () => {}, warn: () => {}, error: () => {} },
+    localStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} },
+    sessionStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} },
+    fetch: () => Promise.resolve({}),
+    XMLHttpRequest: class FakeXHR {},
+    addEventListener: () => {},
+    removeEventListener: () => {}
   };
-  
+
   const context = vm.createContext(sandbox);
 
-  // Execute sites.js inside the isolated context
-  vm.runInContext(code, context);
+  // Wrap code block to capture top-level let/const bindings in local lexical scope
+  const wrappedCode = `
+    ${code};
+    ({
+      defaultSites: typeof defaultSites !== 'undefined' ? defaultSites : undefined,
+      defaultSites_OAM: typeof defaultSites_OAM !== 'undefined' ? defaultSites_OAM : undefined,
+      sites: typeof sites !== 'undefined' ? sites : undefined
+    })
+  `;
 
-  // Extract site dictionaries (supports standard BPC and OAM extension formats)
-  const rawSites = context.defaultSites || context.defaultSites_OAM || context.sites || {};
+  const result = vm.runInContext(wrappedCode, context);
+  const rawSites = result.defaultSites || result.defaultSites_OAM || result.sites || {};
+
   const extractedDomains = new Set();
   const extractedArchiveDomains = new Set();
   const sitesMap = {};
@@ -41,11 +53,10 @@ try {
   for (const [siteKey, config] of Object.entries(rawSites)) {
     if (!config || typeof config !== 'object') continue;
 
-    // Resolve domain array or string
     let domainList = [];
     if (config.domain) {
       domainList = Array.isArray(config.domain) ? config.domain : [config.domain];
-    } else if (siteKey.includes('.')) {
+    } else if (/^[a-z0-9-]+\.[a-z]{2,}$/i.test(siteKey)) {
       domainList = [siteKey];
     }
 
@@ -55,13 +66,11 @@ try {
 
       extractedDomains.add(dom);
 
-      // Check for archive requirements in site config
       const configStr = JSON.stringify(config).toLowerCase();
       if (configStr.includes('archive') || configStr.includes('wayback')) {
         extractedArchiveDomains.add(dom);
       }
 
-      // Populate site rules mapping for runtime server lookup
       sitesMap[dom] = {
         domain: dom,
         useragent: config.useragent || config.useragent_custom || null,
