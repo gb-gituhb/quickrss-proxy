@@ -110,7 +110,7 @@ function escapeHtml(str) {
   return String(str)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
-    .replace(/\>/g, '&gt;')
+    .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
 }
@@ -373,8 +373,8 @@ function resolveBpcStrategy(targetUrl) {
   }
 
   const pipelineSequence = isArchiveForced
-    ? [fetchViaArchivePh, fetchViaLiveMiddleware, fetchViaWayback, fetchDirect]
-    : [fetchDirect, fetchViaLiveMiddleware, fetchViaArchivePh, fetchViaWayback];
+    ? [fetchViaArchivePh, fetchViaArchiveToday, fetchViaLiveMiddleware, fetchViaWayback, fetchDirect]
+    : [fetchDirect, fetchViaLiveMiddleware, fetchViaArchivePh, fetchViaArchiveToday, fetchViaWayback];
 
   return {
     hostname,
@@ -454,7 +454,7 @@ async function fetchViaArchivePh(targetUrl, bpcConfig, parentSignal, stripImages
   const archivePhUrl = `https://archive.ph/newest/${encodeURIComponent(targetUrl)}`;
   const response = await fetch(`https://r.jina.ai/${archivePhUrl}`, {
     headers: getJinaHeaders(),
-    signal: getCombinedSignal(10000, parentSignal)
+    signal: getCombinedSignal(15000, parentSignal)
   });
   if (!response.ok) throw new Error(`archive.ph HTTP ${response.status}`);
 
@@ -463,6 +463,23 @@ async function fetchViaArchivePh(targetUrl, bpcConfig, parentSignal, stripImages
 
   const htmlContent = await marked.parse(json.data.content);
   if (!isValidContent(htmlContent)) throw new Error('archive.ph snapshot not found or blocked');
+
+  return buildKindleHTML(json.data.title || 'Archived Article', htmlContent, targetUrl, stripImages);
+}
+
+async function fetchViaArchiveToday(targetUrl, bpcConfig, parentSignal, stripImages = false) {
+  const archiveTodayUrl = `https://archive.today/newest/${encodeURIComponent(targetUrl)}`;
+  const response = await fetch(`https://r.jina.ai/${archiveTodayUrl}`, {
+    headers: getJinaHeaders(),
+    signal: getCombinedSignal(15000, parentSignal)
+  });
+  if (!response.ok) throw new Error(`archive.today HTTP ${response.status}`);
+
+  const json = await response.json();
+  if (!json.data || !json.data.content) throw new Error('archive.today payload empty');
+
+  const htmlContent = await marked.parse(json.data.content);
+  if (!isValidContent(htmlContent)) throw new Error('archive.today snapshot missing or blocked');
 
   return buildKindleHTML(json.data.title || 'Archived Article', htmlContent, targetUrl, stripImages);
 }
@@ -545,7 +562,7 @@ app.get('/extract', async (req, res) => {
   const debug = req.query.debug === 'true' || req.query.debug === '1';
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 25000);
+  const timeout = setTimeout(() => controller.abort(), 30000);
 
   try {
     const result = await executePipeline(targetUrl, controller.signal, stripImages, debug);
