@@ -1,84 +1,86 @@
 const fs = require('fs');
 const path = require('path');
+const vm = require('vm');
 
 const sitesJsPath = path.join(__dirname, 'sites.js');
 const outputPath = path.join(__dirname, 'bpc-rules.json');
 
-// Default fallback configuration if sites.js is absent
-const fallbackConfig = {
-  domains: [
-    "nytimes.com",
-    "wsj.com",
-    "washingtonpost.com",
-    "economist.com",
-    "bloomberg.com",
-    "ft.com",
-    "barrons.com"
-  ],
-  archiveDomains: [
-    "bloomberg.com",
-    "ft.com",
-    "barrons.com"
-  ],
-  sitesMap: {
-    "economist.com": { "stripImages": true, "timeoutMs": 3500 },
-    "ft.com": { "stripImages": true },
-    "wsj.com": { "useragent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)" }
-  }
-};
-
+// Graceful fallback if sites.js is not present
 if (!fs.existsSync(sitesJsPath)) {
-  console.warn('[BUILD] sites.js not found. Generating default bpc-rules.json...');
-  fs.writeFileSync(outputPath, JSON.stringify(fallbackConfig, null, 2));
-  console.log('[BUILD] Created fallback bpc-rules.json successfully.');
+  console.warn('[BUILD] sites.js not found in root. Generating minimal fallback bpc-rules.json...');
+  const fallback = { domains: [], archiveDomains: [], sitesMap: {} };
+  fs.writeFileSync(outputPath, JSON.stringify(fallback, null, 2));
   process.exit(0);
 }
 
 try {
-  const content = fs.readFileSync(sitesJsPath, 'utf-8');
-  const domainsSet = new Set();
-  const archiveDomainsSet = new Set();
+  const code = fs.readFileSync(sitesJsPath, 'utf-8');
+
+  // Construct standard browser sandbox environment required by sites.js
+  const sandbox = {
+    window: {},
+    document: {},
+    location: { href: '', hostname: '' },
+    navigator: { userAgent: 'Mozilla/5.0' },
+    chrome: { runtime: { id: 'proxy-build' } },
+    browser: { runtime: { id: 'proxy-build' } },
+    console: { log: () => {}, warn: () => {}, error: () => {} }
+  };
+  
+  const context = vm.createContext(sandbox);
+
+  // Execute sites.js inside the isolated context
+  vm.runInContext(code, context);
+
+  // Extract site dictionaries (supports standard BPC and OAM extension formats)
+  const rawSites = context.defaultSites || context.defaultSites_OAM || context.sites || {};
+  const extractedDomains = new Set();
+  const extractedArchiveDomains = new Set();
   const sitesMap = {};
 
-  // Regex to extract domain strings from sites.js definitions
-  const domainRegex = /['"]([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})['"]/g;
-  let match;
+  for (const [siteKey, config] of Object.entries(rawSites)) {
+    if (!config || typeof config !== 'object') continue;
 
-  while ((match = domainRegex.exec(content)) !== null) {
-    const domain = match[1].toLowerCase().replace(/^www\./, '');
-    
-    // Ignore script/json file extensions accidentally matched
-    if (!domain.endsWith('.js') && !domain.endsWith('.json')) {
-      domainsSet.add(domain);
+    // Resolve domain array or string
+    let domainList = [];
+    if (config.domain) {
+      domainList = Array.isArray(config.domain) ? config.domain : [config.domain];
+    } else if (siteKey.includes('.')) {
+      domainList = [siteKey];
+    }
 
-      // Check if domain in sites.js triggers archive redirects/rules
-      const domainBlockRegex = new RegExp(`"${domain}"[\\s\\S]*?\\}`, 'i');
-      const blockMatch = content.match(domainBlockRegex);
+    for (const rawDom of domainList) {
+      const dom = String(rawDom).toLowerCase().replace(/^www\./, '').trim();
+      if (!dom || dom.endsWith('.js') || dom.endsWith('.json')) continue;
 
-      if (blockMatch && blockMatch[0].toLowerCase().includes('archive')) {
-        archiveDomainsSet.add(domain);
+      extractedDomains.add(dom);
+
+      // Check for archive requirements in site config
+      const configStr = JSON.stringify(config).toLowerCase();
+      if (configStr.includes('archive') || configStr.includes('wayback')) {
+        extractedArchiveDomains.add(dom);
       }
 
-      // Initialize site rule object
-      sitesMap[domain] = {
-        domain: domain
+      // Populate site rules mapping for runtime server lookup
+      sitesMap[dom] = {
+        domain: dom,
+        useragent: config.useragent || config.useragent_custom || null,
+        referer: config.referer || null,
+        stripImages: Boolean(config.strip_images || config.no_images),
+        timeoutMs: config.timeout || null
       };
     }
   }
 
-  // Example manually defined overrides for specific heavy news sites
-  if (sitesMap['economist.com']) sitesMap['economist.com'].stripImages = true;
-  if (sitesMap['ft.com']) sitesMap['ft.com'].stripImages = true;
-
-  const outputData = {
-    domains: Array.from(domainsSet),
-    archiveDomains: Array.from(archiveDomainsSet),
-    sitesMap: sitesMap
+  const output = {
+    domains: Array.from(extractedDomains),
+    archiveDomains: Array.from(extractedArchiveDomains),
+    sitesMap
   };
 
-  fs.writeFileSync(outputPath, JSON.stringify(outputData, null, 2));
-  console.log(`[BUILD] Generated bpc-rules.json with ${outputData.domains.length} domains (${outputData.archiveDomains.length} archive-flagged).`);
+  fs.writeFileSync(outputPath, JSON.stringify(output, null, 2));
+  console.log(`[BUILD] Successfully compiled ${output.domains.length} domains and ${output.archiveDomains.length} archive rules into bpc-rules.json.`);
 } catch (err) {
-  console.error('[BUILD] Error compiling bpc-rules.json:', err.message);
+  console.error('[BUILD] Failed to compile sites.js:', err.message);
   process.exit(1);
 }
