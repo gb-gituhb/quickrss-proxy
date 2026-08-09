@@ -142,7 +142,7 @@ function getJinaHeaders() {
     return headers;
 }
 
-// Universal Content Quality Gate with sliced scanning window (prevents ReDoS/CPU lockup)
+// Universal Content Quality Gate with sliced scanning window
 function isValidContent(htmlContent) {
     if (!htmlContent) return false;
 
@@ -269,29 +269,14 @@ async function fetchViaWayback(targetUrl) {
     return await fetchDirect(snapshotUrl);
 }
 
-// Hedged pipeline execution
+// Pipeline Execution (Sequential Tiers)
 async function executePipeline(targetUrl) {
-    // 1. Check LRU Cache
     const cachedHtml = articleCache.get(targetUrl);
     if (cachedHtml) {
         return cachedHtml;
     }
 
-    const timeoutPromise = (ms) => new Promise((_, reject) => setTimeout(() => reject(new Error('Hedge delay elapsed')), ms));
-
-    // Speculative Execution: Attempt Tier 1 with a 1.2s delay guard
-    try {
-        const result = await Promise.race([
-            fetchDirect(targetUrl),
-            timeoutPromise(1200)
-        ]);
-        articleCache.set(targetUrl, result);
-        return result;
-    } catch (_) {
-        // Tier 1 took too long or failed; proceed to sequential fallbacks
-    }
-
-    for (const tierFn of [fetchViaLiveMiddleware, fetchViaArchivePh, fetchViaWayback]) {
+    for (const tierFn of [fetchDirect, fetchViaLiveMiddleware, fetchViaArchivePh, fetchViaWayback]) {
         try {
             const html = await tierFn(targetUrl);
             articleCache.set(targetUrl, html);
