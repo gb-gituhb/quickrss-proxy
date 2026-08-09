@@ -7,11 +7,21 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const JINA_API_KEY = process.env.JINA_API_KEY || '';
 
+// Domains known to break Mozilla Readability (forces instant failover to Tier 2 Jina)
+const BYPASS_READABILITY_DOMAINS = [
+    'bbc.com',
+    'bbc.co.uk',
+    'theguardian.com',
+    'medium.com',
+    'bloomberg.com',
+    'nytimes.com',
+    'wsj.com'
+];
+
 // Clean out QuickRSS tracking prefixes, trailing quotes, and extract valid URLs
 function sanitizeUrl(rawUrl) {
     if (!rawUrl) return null;
     
-    // Take the last item if Express parsed an array, cast to string, trim quotes and whitespace
     let urlString = Array.isArray(rawUrl) ? String(rawUrl[rawUrl.length - 1]) : String(rawUrl);
     urlString = urlString.trim().replace(/^['"]|['"]$/g, '');
 
@@ -118,9 +128,12 @@ function getJinaHeaders() {
     return headers;
 }
 
-function isValidContent(text) {
-    if (!text || text.trim().length < 200) return false;
-    const lower = text.toLowerCase();
+function isValidContent(htmlContent) {
+    if (!htmlContent) return false;
+
+    // Convert HTML to plain text for word/character validation
+    const plainText = htmlContent.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    const lower = plainText.toLowerCase();
     
     // 1. Hard bot-blocker errors
     const hardErrors = [
@@ -132,7 +145,7 @@ function isValidContent(text) {
         return false;
     }
 
-    // 2. Truncation, teaser, & paywall phrases (forces failover to Jina/Archive for incomplete articles)
+    // 2. Truncation, teaser, & paywall phrases
     const truncationMarkers = [
         'continue reading', 'read full story', 'read full article', 
         'read the full article', 'keep reading', 'subscribe to read', 
@@ -140,12 +153,16 @@ function isValidContent(text) {
         'sign in to continue', 'register to read', 'read more'
     ];
 
-    if (truncationMarkers.some(keyword => lower.includes(keyword)) && text.length < 3000) {
+    if (truncationMarkers.some(keyword => lower.includes(keyword)) && plainText.length < 3000) {
         return false;
     }
 
-    // 3. Reject anything under 500 characters
-    if (text.length < 500) {
+    // 3. Strict Paragraph & Word Count Guard
+    // Rejects 1-line BBC/RSS teasers and forces failover to Tier 2 (Jina)
+    const paragraphCount = (htmlContent.match(/<p[\s>]/gi) || []).length;
+    const wordCount = plainText.split(/\s+/).filter(Boolean).length;
+
+    if (paragraphCount < 2 || wordCount < 120) {
         return false;
     }
 
@@ -154,6 +171,11 @@ function isValidContent(text) {
 
 // Tier 1: Direct Fetch (5s Timeout)
 async function fetchDirect(targetUrl) {
+    // Instant failover for domains known to break Mozilla Readability
+    if (BYPASS_READABILITY_DOMAINS.some(domain => targetUrl.toLowerCase().includes(domain))) {
+        throw new Error(`Domain in bypass list (${targetUrl}); routing directly to Tier 2 (Jina)`);
+    }
+
     const response = await fetch(targetUrl, {
         headers: {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -243,7 +265,7 @@ async function fetchViaWayback(targetUrl) {
     return await fetchDirect(snapshotUrl);
 }
 
-// Health Check Route (used by UptimeRobot to keep Render warm 24/7)
+// Health Check Route (kept warm by pings)
 app.get('/health', (req, res) => {
     res.status(200).send('OK');
 });
