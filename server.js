@@ -1,4 +1,3 @@
-// server.js
 const express = require('express');
 const { parseHTML } = require('linkedom');
 const { marked } = require('marked');
@@ -25,6 +24,17 @@ const HARDCODED_ARCHIVE_DOMAINS = new Set([
   'welt.de'
 ]);
 
+const LONGFORM_DOMAINS = new Set([
+  'nytimes.com',
+  'economist.com',
+  'newyorker.com',
+  'theatlantic.com',
+  'washingtonpost.com',
+  'wsj.com',
+  'ft.com',
+  'bloomberg.com'
+]);
+
 const rulesPath = path.join(__dirname, 'bpc-rules.json');
 let bpcRules = { sitesMap: {}, domains: new Set(), archiveDomains: new Set() };
 
@@ -36,7 +46,6 @@ if (fs.existsSync(rulesPath)) {
       domains: new Set((raw.domains || []).map(d => d.toLowerCase())),
       archiveDomains: new Set((raw.archiveDomains || []).map(d => d.toLowerCase()))
     };
-    console.log(`[BPC RULE ENGINE] Loaded ${bpcRules.domains.size} domains (${bpcRules.archiveDomains.size} archive-flagged).`);
   } catch (err) {
     console.warn('[BPC RULE ENGINE] Warning: Failed to parse bpc-rules.json');
   }
@@ -83,7 +92,6 @@ if (fs.existsSync(PERSISTENT_ROUTES_FILE)) {
   try {
     const saved = JSON.parse(fs.readFileSync(PERSISTENT_ROUTES_FILE, 'utf-8'));
     autoLearnedArchiveDomains = new Set(saved);
-    console.log(`[AUTO-ROUTER] Loaded ${autoLearnedArchiveDomains.size} auto-learned archive domains.`);
   } catch (_) {}
 }
 
@@ -138,6 +146,18 @@ function sanitizeUrl(rawUrl) {
     } catch (_) {}
   }
   return null;
+}
+
+function matchesDomainSet(hostname, domainSet) {
+  if (!hostname || !(domainSet instanceof Set)) return false;
+  if (domainSet.has(hostname)) return true;
+
+  const parts = hostname.split('.');
+  for (let i = 1; i < parts.length; i++) {
+    const parentDomain = parts.slice(i).join('.');
+    if (domainSet.has(parentDomain)) return true;
+  }
+  return false;
 }
 
 function sanitizeContent(htmlContent, targetUrl, stripAllImages = false) {
@@ -380,8 +400,18 @@ th, td { border: 1px solid #ccc; padding: 6px; }`;
   return await zip.generateAsync({ type: 'nodebuffer' });
 }
 
-function getJinaHeaders() {
-  const headers = { 'Accept': 'application/json' };
+function getJinaHeaders(forArchive = false) {
+  const headers = { 
+    'Accept': 'application/json',
+    'X-No-Cache': 'true'
+  };
+
+  if (!forArchive) {
+    headers['X-Wait-For-Selector'] = 'article, [role="main"], .article-body, .post-content, #article-content';
+    headers['X-Respond-Timing'] = 'network-idle';
+    headers['X-Timeout'] = '10';
+  }
+
   if (JINA_API_KEY) headers['Authorization'] = `Bearer ${JINA_API_KEY}`;
   return headers;
 }
@@ -395,48 +425,63 @@ function getCombinedSignal(timeoutMs, parentSignal) {
   return timeoutSignal;
 }
 
-function isValidContent(htmlContent) {
+function isValidContent(htmlContent, targetUrl = '') {
   if (!htmlContent) return false;
 
-  const scanWindow = htmlContent.length > 150000 ? htmlContent.slice(0, 150000) : htmlContent;
+  const scanWindow = htmlContent.length > 200000 ? htmlContent.slice(0, 200000) : htmlContent;
   const plainText = scanWindow.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
   const lower = plainText.toLowerCase();
 
   const hardErrors = [
     'captcha', 'enable javascript', 'access denied',
     'security check', 'just a moment...', 'pardon our interruption',
-    'enable cookies', 'cf-browser-verification'
+    'enable cookies', 'cf-browser-verification', 'human verification'
   ];
   if (hardErrors.some(keyword => lower.includes(keyword))) {
     return false;
   }
 
-  const wordCount = plainText.split(/\s+/).filter(Boolean).length;
   const truncationMarkers = [
     'continue reading', 'read full story', 'read full article',
     'read the full article', 'keep reading', 'subscribe to read',
-    'create an account to read', 'log in to read',
-    'sign in to continue', 'register to read'
+    'create an account to read', 'log in to read', 'sign in to continue',
+    'register to read', 'read more', 'show more', 'expand', 'unlock this article',
+    'subscriber only', 'subscribers only', 'premium content',
+    'this article is for subscribers', 'you have reached your limit',
+    'already a subscriber', 'subscribe now', 'get unlimited access',
+    'to continue reading', 'sign in to read', 'log in to continue',
+    'exclusive for members', 'member exclusive', 'full access',
+    'enjoying this article?', 'limited access'
   ];
 
-  if (truncationMarkers.some(keyword => lower.includes(keyword)) && wordCount < 450) {
+  if (truncationMarkers.some(keyword => lower.includes(keyword))) {
     return false;
   }
 
+  const wordCount = plainText.split(/\s+/).filter(Boolean).length;
   const paragraphCount = (scanWindow.match(/<p[\s>]/gi) || []).length;
-  return !(wordCount < 200 || paragraphCount < 2);
-}
 
-function matchesDomainSet(hostname, domainSet) {
-  if (!hostname || !(domainSet instanceof Set)) return false;
-  if (domainSet.has(hostname)) return true;
-
-  const parts = hostname.split('.');
-  for (let i = 1; i < parts.length; i++) {
-    const parentDomain = parts.slice(i).join('.');
-    if (domainSet.has(parentDomain)) return true;
+  const softPaywallSignals = [
+    'subscription', 'subscribe', 'membership', 'premium',
+    'paywall', 'logged in', 'sign in', 'register free'
+  ];
+  const softSignalCount = softPaywallSignals.filter(k => lower.includes(k)).length;
+  if (wordCount < 600 && softSignalCount >= 2) {
+    return false;
   }
-  return false;
+
+  let hostname = '';
+  if (targetUrl) {
+    try {
+      hostname = new URL(targetUrl).hostname.replace(/^www\./, '').toLowerCase();
+    } catch (_) {}
+  }
+
+  if (matchesDomainSet(hostname, LONGFORM_DOMAINS) && wordCount < 800) {
+    return false;
+  }
+
+  return !(wordCount < 300 || paragraphCount < 3);
 }
 
 function findSiteRule(hostname, sitesMap = {}) {
@@ -472,7 +517,7 @@ function resolveBpcStrategy(targetUrl) {
 }
 
 async function fetchViaLiveMiddleware(targetUrl, bpcConfig, parentSignal, stripImages = false) {
-  const headers = getJinaHeaders();
+  const headers = getJinaHeaders(false);
   if (bpcConfig.siteRule?.useragent) {
     headers['X-User-Agent'] = bpcConfig.siteRule.useragent;
   }
@@ -487,7 +532,7 @@ async function fetchViaLiveMiddleware(targetUrl, bpcConfig, parentSignal, stripI
   if (!json.data || !json.data.content) throw new Error('Jina Live payload empty');
 
   const htmlContent = await marked.parse(json.data.content);
-  if (!isValidContent(htmlContent)) throw new Error('Jina Live content invalid or paywalled');
+  if (!isValidContent(htmlContent, targetUrl)) throw new Error('Jina Live content invalid or paywalled');
 
   return { title: json.data.title || 'Article', content: htmlContent, url: targetUrl };
 }
@@ -495,7 +540,7 @@ async function fetchViaLiveMiddleware(targetUrl, bpcConfig, parentSignal, stripI
 async function fetchViaArchivePh(targetUrl, bpcConfig, parentSignal, stripImages = false) {
   const archivePhUrl = `https://archive.ph/newest/${encodeURIComponent(targetUrl)}`;
   const response = await fetch(`https://r.jina.ai/${archivePhUrl}`, {
-    headers: getJinaHeaders(),
+    headers: getJinaHeaders(true),
     signal: getCombinedSignal(15000, parentSignal)
   });
   if (!response.ok) throw new Error(`archive.ph HTTP ${response.status}`);
@@ -504,7 +549,7 @@ async function fetchViaArchivePh(targetUrl, bpcConfig, parentSignal, stripImages
   if (!json.data || !json.data.content) throw new Error('archive.ph payload empty');
 
   const htmlContent = await marked.parse(json.data.content);
-  if (!isValidContent(htmlContent)) throw new Error('archive.ph snapshot not found or blocked');
+  if (!isValidContent(htmlContent, targetUrl)) throw new Error('archive.ph snapshot not found or blocked');
 
   return { title: json.data.title || 'Archived Article', content: htmlContent, url: targetUrl };
 }
@@ -512,7 +557,7 @@ async function fetchViaArchivePh(targetUrl, bpcConfig, parentSignal, stripImages
 async function fetchViaArchiveToday(targetUrl, bpcConfig, parentSignal, stripImages = false) {
   const archiveTodayUrl = `https://archive.today/newest/${encodeURIComponent(targetUrl)}`;
   const response = await fetch(`https://r.jina.ai/${archiveTodayUrl}`, {
-    headers: getJinaHeaders(),
+    headers: getJinaHeaders(true),
     signal: getCombinedSignal(15000, parentSignal)
   });
   if (!response.ok) throw new Error(`archive.today HTTP ${response.status}`);
@@ -521,7 +566,7 @@ async function fetchViaArchiveToday(targetUrl, bpcConfig, parentSignal, stripIma
   if (!json.data || !json.data.content) throw new Error('archive.today payload empty');
 
   const htmlContent = await marked.parse(json.data.content);
-  if (!isValidContent(htmlContent)) throw new Error('archive.today snapshot missing or blocked');
+  if (!isValidContent(htmlContent, targetUrl)) throw new Error('archive.today snapshot missing or blocked');
 
   return { title: json.data.title || 'Archived Article', content: htmlContent, url: targetUrl };
 }
@@ -529,7 +574,7 @@ async function fetchViaArchiveToday(targetUrl, bpcConfig, parentSignal, stripIma
 async function fetchViaGhostArchive(targetUrl, bpcConfig, parentSignal, stripImages = false) {
   const ghostUrl = `https://ghostarchive.org/archive/${encodeURIComponent(targetUrl)}`;
   const response = await fetch(`https://r.jina.ai/${ghostUrl}`, {
-    headers: getJinaHeaders(),
+    headers: getJinaHeaders(true),
     signal: getCombinedSignal(12000, parentSignal)
   });
   if (!response.ok) throw new Error(`Ghost Archive HTTP ${response.status}`);
@@ -538,7 +583,7 @@ async function fetchViaGhostArchive(targetUrl, bpcConfig, parentSignal, stripIma
   if (!json.data || !json.data.content) throw new Error('Ghost Archive payload empty');
 
   const htmlContent = await marked.parse(json.data.content);
-  if (!isValidContent(htmlContent)) throw new Error('Ghost Archive snapshot missing or blocked');
+  if (!isValidContent(htmlContent, targetUrl)) throw new Error('Ghost Archive snapshot missing or blocked');
 
   return { title: json.data.title || 'Archived Article', content: htmlContent, url: targetUrl };
 }
@@ -554,7 +599,7 @@ async function fetchViaWayback(targetUrl, bpcConfig, parentSignal, stripImages =
   if (!snapshotUrl) throw new Error('No Wayback snapshot available');
 
   const response = await fetch(`https://r.jina.ai/${snapshotUrl}`, {
-    headers: getJinaHeaders(),
+    headers: getJinaHeaders(true),
     signal: getCombinedSignal(12000, parentSignal)
   });
   if (!response.ok) throw new Error(`Wayback Jina Fetch HTTP ${response.status}`);
@@ -563,12 +608,12 @@ async function fetchViaWayback(targetUrl, bpcConfig, parentSignal, stripImages =
   if (!json.data || !json.data.content) throw new Error('Wayback payload empty');
 
   const htmlContent = await marked.parse(json.data.content);
-  if (!isValidContent(htmlContent)) throw new Error('Wayback snapshot invalid');
+  if (!isValidContent(htmlContent, targetUrl)) throw new Error('Wayback snapshot invalid');
 
   return { title: json.data.title || 'Archived Article', content: htmlContent, url: targetUrl };
 }
 
-async function raceFetchers(fetchers, targetUrl, bpcConfig, globalSignal, stripImages, staggerMs = 800) {
+async function raceFetchers(fetchers, targetUrl, bpcConfig, globalSignal, stripImages, debug = false, staggerMs = 800) {
   const raceController = new AbortController();
   const combinedSignal = AbortSignal.any ? AbortSignal.any([globalSignal, raceController.signal]) : raceController.signal;
 
@@ -581,9 +626,12 @@ async function raceFetchers(fetchers, targetUrl, bpcConfig, globalSignal, stripI
           if (res && res.content) {
             resolve({ result: res, fetcherName: fetcherFn.name });
           } else {
-            reject(new Error(`${fetcherFn.name} returned empty content`));
+            const err = new Error(`${fetcherFn.name} returned empty content`);
+            if (debug) console.error(`[FETCHER FAILED] Target: ${targetUrl} | Provider: ${fetcherFn.name} | Reason: ${err.message}`);
+            reject(err);
           }
         } catch (err) {
+          if (debug) console.error(`[FETCHER FAILED] Target: ${targetUrl} | Provider: ${fetcherFn.name} | Reason: ${err.message}`);
           reject(err);
         }
       }, index * staggerMs);
@@ -625,7 +673,7 @@ async function executeOptimizedPipeline(targetUrl, globalSignal, stripImages = f
   if (isKnownArchive) {
     const archiveFetchers = [fetchViaArchivePh, fetchViaArchiveToday, fetchViaGhostArchive, fetchViaWayback];
     try {
-      const { result } = await raceFetchers(archiveFetchers, targetUrl, bpcConfig, globalSignal, effectiveStripImages, 300);
+      const { result } = await raceFetchers(archiveFetchers, targetUrl, bpcConfig, globalSignal, effectiveStripImages, debug, 300);
       articleCache.set(cacheKey, result);
       return result;
     } catch (err) {
@@ -636,11 +684,10 @@ async function executeOptimizedPipeline(targetUrl, globalSignal, stripImages = f
 
   try {
     const liveRaceCandidates = [fetchViaLiveMiddleware, fetchViaArchivePh];
-    const { result, fetcherName } = await raceFetchers(liveRaceCandidates, targetUrl, bpcConfig, globalSignal, effectiveStripImages, 800);
+    const { result, fetcherName } = await raceFetchers(liveRaceCandidates, targetUrl, bpcConfig, globalSignal, effectiveStripImages, debug, 800);
 
     if (fetcherName !== 'fetchViaLiveMiddleware' && hostname) {
       persistLearnedDomain(hostname);
-      if (debug) console.log(`[AUTO-LEARN] Promoted ${hostname} to Archive-Forced domain routes.`);
     }
 
     articleCache.set(cacheKey, result);
@@ -648,7 +695,7 @@ async function executeOptimizedPipeline(targetUrl, globalSignal, stripImages = f
   } catch (primaryRaceErr) {
     try {
       const deepFallbackCandidates = [fetchViaArchiveToday, fetchViaGhostArchive, fetchViaWayback];
-      const { result } = await raceFetchers(deepFallbackCandidates, targetUrl, bpcConfig, globalSignal, effectiveStripImages, 300);
+      const { result } = await raceFetchers(deepFallbackCandidates, targetUrl, bpcConfig, globalSignal, effectiveStripImages, debug, 300);
 
       if (hostname) {
         persistLearnedDomain(hostname);
