@@ -436,7 +436,7 @@ async function fetchDirect(targetUrl, bpcConfig, parentSignal, stripImages = fal
 async function fetchViaLiveMiddleware(targetUrl, bpcConfig, parentSignal, stripImages = false) {
   const response = await fetch(`https://r.jina.ai/${targetUrl}`, {
     headers: getJinaHeaders(),
-    signal: getCombinedSignal(5000, parentSignal)
+    signal: getCombinedSignal(10000, parentSignal)
   });
   if (!response.ok) throw new Error(`Jina Live HTTP ${response.status}`);
 
