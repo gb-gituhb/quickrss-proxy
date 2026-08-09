@@ -6,8 +6,9 @@ const { marked } = require('marked');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const JINA_API_KEY = process.env.JINA_API_KEY || '';
+const AUTH_TOKEN = process.env.AUTH_TOKEN || '';
 
-// In-memory LRU Cache (200 articles, 1-hour TTL)
+// In-memory LRU Cache Implementation
 class SimpleLRUCache {
     constructor(limit = 200, ttlMs = 60 * 60 * 1000) {
         this.limit = limit;
@@ -37,16 +38,56 @@ class SimpleLRUCache {
     }
 }
 
+// Caches: 200 articles (1-hr TTL), 100 failed URLs (5-min TTL)
 const articleCache = new SimpleLRUCache(200, 60 * 60 * 1000);
+const errorCache = new SimpleLRUCache(100, 5 * 60 * 1000);
 
-// Clean out QuickRSS tracking prefixes, trailing quotes, and extract valid URLs
+// Basic Authentication Middleware
+app.use((req, res, next) => {
+    if (req.path === '/health') return next();
+    if (!AUTH_TOKEN) return next(); // Bypassed if AUTH_TOKEN environment variable is not set
+
+    const token = req.headers['x-auth-token'] || req.query.token;
+    if (token !== AUTH_TOKEN) {
+        return res.status(401).send('Unauthorized');
+    }
+    next();
+});
+
+// Escape HTML special characters for titles
+function escapeHtml(str) {
+    if (!str) return '';
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+// Clean tracking prefixes, handle parentheses in URLs, and validate with native URL parser
 function sanitizeUrl(rawUrl) {
     if (!rawUrl) return null;
     let urlString = Array.isArray(rawUrl) ? String(rawUrl[rawUrl.length - 1]) : String(rawUrl);
     urlString = urlString.trim().replace(/^['"]|['"]$/g, '');
 
+    try {
+        const parsed = new URL(urlString);
+        if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+            return parsed.href;
+        }
+    } catch (_) {}
+
     const match = urlString.match(/(https?:\/\/[^\s'"]+)/i);
-    return match ? match[1] : null;
+    if (match) {
+        try {
+            const parsed = new URL(match[1]);
+            if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+                return parsed.href;
+            }
+        } catch (_) {}
+    }
+    return null;
 }
 
 // DOM-based image sanitizer with explicit DOM memory cleanup
@@ -103,12 +144,14 @@ function sanitizeImages(htmlContent, targetUrl) {
 
 function buildKindleHTML(title, content, targetUrl = '') {
     const cleanedContent = targetUrl ? sanitizeImages(content, targetUrl) : content;
+    const safeTitle = escapeHtml(title || 'Untitled');
+
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>${title || 'Article'}</title>
+    <title>${safeTitle}</title>
     <style>
         @font-face { font-family: 'Charis SIL'; src: local('Charis SIL'); }
         body {
@@ -129,7 +172,7 @@ function buildKindleHTML(title, content, targetUrl = '') {
     </style>
 </head>
 <body>
-    <h1>${title || 'Untitled'}</h1>
+    <h1>${safeTitle}</h1>
     <hr>
     ${cleanedContent}
 </body>
@@ -140,6 +183,16 @@ function getJinaHeaders() {
     const headers = { 'Accept': 'application/json', 'X-No-Cache': 'true' };
     if (JINA_API_KEY) headers['Authorization'] = `Bearer ${JINA_API_KEY}`;
     return headers;
+}
+
+// Combines tier timeout with route-level parent AbortSignal
+function getCombinedSignal(timeoutMs, parentSignal) {
+    const timeoutSignal = AbortSignal.timeout(timeoutMs);
+    if (!parentSignal) return timeoutSignal;
+    if (typeof AbortSignal.any === 'function') {
+        return AbortSignal.any([timeoutSignal, parentSignal]);
+    }
+    return timeoutSignal;
 }
 
 // Universal Content Quality Gate with sliced scanning window
@@ -180,7 +233,7 @@ function isValidContent(htmlContent) {
 }
 
 // Tier 1: Direct Fetch (2.5s Timeout)
-async function fetchDirect(targetUrl) {
+async function fetchDirect(targetUrl, parentSignal) {
     let dom = null;
     try {
         const response = await fetch(targetUrl, {
@@ -190,7 +243,7 @@ async function fetchDirect(targetUrl) {
                 'Accept-Language': 'en-US,en;q=0.5',
                 'Referer': 'https://www.google.com/'
             },
-            signal: AbortSignal.timeout(2500)
+            signal: getCombinedSignal(2500, parentSignal)
         });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const html = await response.text();
@@ -221,10 +274,10 @@ async function fetchDirect(targetUrl) {
 }
 
 // Tier 2: Live Anti-Bot Middleware (6s Timeout)
-async function fetchViaLiveMiddleware(targetUrl) {
+async function fetchViaLiveMiddleware(targetUrl, parentSignal) {
     const response = await fetch(`https://r.jina.ai/${targetUrl}`, {
         headers: getJinaHeaders(),
-        signal: AbortSignal.timeout(6000)
+        signal: getCombinedSignal(6000, parentSignal)
     });
     if (!response.ok) throw new Error(`Jina Live HTTP ${response.status}`);
     
@@ -238,11 +291,11 @@ async function fetchViaLiveMiddleware(targetUrl) {
 }
 
 // Tier 3: archive.ph via Middleware (7s Timeout)
-async function fetchViaArchivePh(targetUrl) {
+async function fetchViaArchivePh(targetUrl, parentSignal) {
     const archivePhUrl = `https://archive.ph/newest/${targetUrl}`;
     const response = await fetch(`https://r.jina.ai/${archivePhUrl}`, {
         headers: getJinaHeaders(),
-        signal: AbortSignal.timeout(7000)
+        signal: getCombinedSignal(7000, parentSignal)
     });
     if (!response.ok) throw new Error(`archive.ph HTTP ${response.status}`);
 
@@ -256,9 +309,9 @@ async function fetchViaArchivePh(targetUrl) {
 }
 
 // Tier 4: Wayback Machine Fallback (4s Timeout)
-async function fetchViaWayback(targetUrl) {
+async function fetchViaWayback(targetUrl, parentSignal) {
     const apiRes = await fetch(`https://archive.org/wayback/available?url=${encodeURIComponent(targetUrl)}`, {
-        signal: AbortSignal.timeout(4000)
+        signal: getCombinedSignal(4000, parentSignal)
     });
     if (!apiRes.ok) throw new Error(`Wayback API HTTP ${apiRes.status}`);
 
@@ -266,19 +319,24 @@ async function fetchViaWayback(targetUrl) {
     const snapshotUrl = apiData?.archived_snapshots?.closest?.url;
     if (!snapshotUrl) throw new Error('No Wayback snapshot available');
 
-    return await fetchDirect(snapshotUrl);
+    return await fetchDirect(snapshotUrl, parentSignal);
 }
 
-// Pipeline Execution (Sequential Tiers)
-async function executePipeline(targetUrl) {
+// Pipeline Execution
+async function executePipeline(targetUrl, signal) {
     const cachedHtml = articleCache.get(targetUrl);
     if (cachedHtml) {
         return cachedHtml;
     }
 
+    if (errorCache.get(targetUrl)) {
+        throw new Error('Recent extraction failure (cached error)');
+    }
+
     for (const tierFn of [fetchDirect, fetchViaLiveMiddleware, fetchViaArchivePh, fetchViaWayback]) {
         try {
-            const html = await tierFn(targetUrl);
+            if (signal?.aborted) break;
+            const html = await tierFn(targetUrl, signal);
             articleCache.set(targetUrl, html);
             return html;
         } catch (_) {
@@ -286,6 +344,7 @@ async function executePipeline(targetUrl) {
         }
     }
 
+    errorCache.set(targetUrl, true);
     throw new Error('Failed to extract article content across all pipelines.');
 }
 
@@ -294,18 +353,29 @@ app.get('/health', (req, res) => res.status(200).send('OK'));
 
 // Main Extraction Route
 app.get('/extract', async (req, res) => {
+    res.set('Content-Type', 'text/html; charset=utf-8');
+
     const rawUrl = req.query.url;
     if (!rawUrl) return res.status(400).send('Missing url parameter');
 
     const targetUrl = sanitizeUrl(rawUrl);
     if (!targetUrl) return res.status(400).send('Invalid URL provided.');
 
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000); // 15s global ceiling
+
     try {
-        const result = await executePipeline(targetUrl);
+        const result = await executePipeline(targetUrl, controller.signal);
         return res.send(result);
     } catch (err) {
+        if (controller.signal.aborted) {
+            console.error(`[Extraction Timeout] ${targetUrl}`);
+            return res.status(504).send('Extraction timed out.');
+        }
         console.error(`[Extraction Failed] ${targetUrl}: ${err.message}`);
         return res.status(500).send('Failed to extract content across all tiers.');
+    } finally {
+        clearTimeout(timeout);
     }
 });
 
