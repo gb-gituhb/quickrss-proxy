@@ -7,34 +7,64 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const JINA_API_KEY = process.env.JINA_API_KEY || '';
 
-// Helper to strip QuickRSS tracking prefixes (e.g., "?step=3,") and safely handle non-string query inputs
+// Clean out QuickRSS tracking prefixes, trailing quotes, and extract valid URLs
 function sanitizeUrl(rawUrl) {
     if (!rawUrl) return null;
     
-    // If Express parses multiple url parameters into an Array, take the last element; otherwise cast to String
-    const urlString = Array.isArray(rawUrl) ? String(rawUrl[rawUrl.length - 1]) : String(rawUrl);
-    
-    const match = urlString.match(/(https?:\/\/[^\s]+)/i);
-    return match ? match[1] : urlString;
+    // Take the last item if Express parsed an array, cast to string, trim quotes and whitespace
+    let urlString = Array.isArray(rawUrl) ? String(rawUrl[rawUrl.length - 1]) : String(rawUrl);
+    urlString = urlString.trim().replace(/^['"]|['"]$/g, '');
+
+    const match = urlString.match(/(https?:\/\/[^\s'"]+)/i);
+    return match ? match[1] : null;
 }
 
-// Clean image tags: make relative URLs absolute & strip tracking pixels to prevent Kindle image caching hangs
+// DOM-based image sanitizer: fixes lazy loading, resolves relative URLs, strips srcset & tracking pixels
 function sanitizeImages(htmlContent, targetUrl) {
     if (!htmlContent) return '';
     
     try {
-        const baseUrl = new URL(targetUrl).origin;
-        
-        // Replace relative img src links (/path/to/img.jpg) with absolute URLs
-        let cleaned = htmlContent.replace(/<img\s+[^>]*src=["'](\/[^"']+)["'][^>]*>/gi, (match, src) => {
-            return match.replace(src, `${baseUrl}${src}`);
+        const dom = parseHTML(`<div>${htmlContent}</div>`);
+        const doc = dom.window.document;
+        const imgs = doc.querySelectorAll('img');
+
+        imgs.forEach(img => {
+            // 1. Swap lazy-load attributes to src if src is missing or a data/placeholder URI
+            const realSrc = img.getAttribute('data-src') || 
+                            img.getAttribute('data-original') || 
+                            img.getAttribute('data-lazy-src') || 
+                            img.getAttribute('src');
+
+            if (!realSrc || realSrc.startsWith('data:')) {
+                img.remove();
+                return;
+            }
+
+            // 2. Strip 1x1 tracking pixels
+            const width = img.getAttribute('width');
+            const height = img.getAttribute('height');
+            if ((width === '1' || width === '0') && (height === '1' || height === '0')) {
+                img.remove();
+                return;
+            }
+
+            // 3. Resolve absolute URL for relative paths (/img.jpg, ./img.jpg, //cdn.com/img.jpg)
+            try {
+                const absUrl = new URL(realSrc, targetUrl).href;
+                img.setAttribute('src', absUrl);
+            } catch (_) {
+                img.remove();
+                return;
+            }
+
+            // 4. Remove attributes that cause Kindle cURL stalls
+            img.removeAttribute('data-src');
+            img.removeAttribute('data-original');
+            img.removeAttribute('data-lazy-src');
+            img.removeAttribute('srcset'); // Removes multi-resolution downloads
         });
 
-        // Remove 1x1 tracking pixels that cause Kindle timeouts
-        cleaned = cleaned.replace(/<img\s+[^>]*width=["']1["']\s+height=["']1["'][^>]*>/gi, '');
-        cleaned = cleaned.replace(/<img\s+[^>]*height=["']1["']\s+width=["']1["'][^>]*>/gi, '');
-
-        return cleaned;
+        return doc.body.firstElementChild ? doc.body.firstElementChild.innerHTML : htmlContent;
     } catch (e) {
         return htmlContent;
     }
@@ -89,18 +119,21 @@ function getJinaHeaders() {
 }
 
 function isValidContent(text) {
-    if (!text || text.length < 150) return false;
+    if (!text || text.trim().length < 150) return false;
     const lower = text.toLowerCase();
     
-    // Hard errors: these ALWAYS mean the fetch failed completely
-    const hardErrors = ['captcha', 'enable javascript', 'access denied', 'security check', 'just a moment...', 'pardon our interruption'];
+    // Hard errors: cause immediate fallback to next tier
+    const hardErrors = [
+        'captcha', 'enable javascript', 'access denied', 
+        'security check', 'just a moment...', 'pardon our interruption',
+        'enable cookies', 'cf-browser-verification'
+    ];
     if (hardErrors.some(keyword => lower.includes(keyword))) {
         return false;
     }
 
-    // Soft paywall phrases: only reject if the extracted content is short (< 800 chars).
-    // Long articles (> 800 chars) often contain "subscribe to read" in footer/navigation links.
-    const softPaywall = ['subscribe to read', 'no snapshot', 'create an account to read'];
+    // Soft paywall phrases: only reject if total character count is low (< 800 chars)
+    const softPaywall = ['subscribe to read', 'no snapshot', 'create an account to read', 'log in to read'];
     if (text.length < 800 && softPaywall.some(keyword => lower.includes(keyword))) {
         return false;
     }
@@ -108,7 +141,7 @@ function isValidContent(text) {
     return true;
 }
 
-// Tier 1: Direct Fetch (4s Timeout)
+// Tier 1: Direct Fetch (5s Timeout)
 async function fetchDirect(targetUrl) {
     const response = await fetch(targetUrl, {
         headers: {
@@ -117,7 +150,7 @@ async function fetchDirect(targetUrl) {
             'Accept-Language': 'en-US,en;q=0.5',
             'Referer': 'https://www.google.com/'
         },
-        signal: AbortSignal.timeout(4000)
+        signal: AbortSignal.timeout(5000)
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const html = await response.text();
@@ -141,7 +174,7 @@ async function fetchDirect(targetUrl) {
     const reader = new Readability(doc);
     const article = reader.parse();
 
-    if (!article || !isValidContent(article.content)) {
+    if (!article || !article.content || !isValidContent(article.content)) {
         throw new Error('Direct fetch content invalid or paywalled');
     }
     return buildKindleHTML(article.title, article.content, targetUrl);
@@ -199,16 +232,14 @@ async function fetchViaWayback(targetUrl) {
     return await fetchDirect(snapshotUrl);
 }
 
-// Extraction Route
+// Main Extraction Route
 app.get('/extract', async (req, res) => {
     const rawUrl = req.query.url;
     if (!rawUrl) return res.status(400).send('Missing url parameter');
 
-    // Clean out QuickRSS prefixes like "?step=3," and safely process arrays/objects
     const targetUrl = sanitizeUrl(rawUrl);
 
-    // Reject invalid or non-HTTP URLs immediately before running pipeline
-    if (!targetUrl || (!targetUrl.startsWith('http://') && !targetUrl.startsWith('https://'))) {
+    if (!targetUrl) {
         return res.status(400).send('Invalid or malformed URL provided.');
     }
 
