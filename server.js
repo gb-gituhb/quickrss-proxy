@@ -63,7 +63,8 @@ function getJinaHeaders() {
 }
 
 function isValidContent(text) {
-    if (!text || text.length < 400) return false;
+    // Lowered threshold to 150 characters to support short video posts and brief news items
+    if (!text || text.length < 150) return false;
     const lower = text.toLowerCase();
     const errorKeywords = ['captcha', 'enable javascript', 'access denied', 'subscribe to read', 'no snapshot', 'security check'];
     return !errorKeywords.some(keyword => lower.includes(keyword));
@@ -73,7 +74,9 @@ function isValidContent(text) {
 async function fetchDirect(targetUrl) {
     const response = await fetch(targetUrl, {
         headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
             'Referer': 'https://www.google.com/'
         },
         signal: AbortSignal.timeout(6000)
@@ -81,11 +84,21 @@ async function fetchDirect(targetUrl) {
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const html = await response.text();
 
+    if (!html || html.trim().length < 200) {
+        throw new Error('Received empty or invalid HTML payload');
+    }
+
     const dom = parseHTML(html);
-    const doc = dom.window.document;
-    const base = doc.createElement('base');
-    base.href = targetUrl;
-    doc.head.appendChild(base);
+    const doc = dom?.window?.document;
+    if (!doc || !doc.documentElement) {
+        throw new Error('Failed to parse valid DOM structure');
+    }
+
+    if (doc.head) {
+        const base = doc.createElement('base');
+        base.href = targetUrl;
+        doc.head.appendChild(base);
+    }
 
     const reader = new Readability(doc);
     const article = reader.parse();
@@ -136,6 +149,11 @@ async function fetchViaWayback(targetUrl) {
     const apiRes = await fetch(`https://archive.org/wayback/available?url=${encodeURIComponent(targetUrl)}`, {
         signal: AbortSignal.timeout(8000)
     });
+    
+    if (!apiRes.ok) throw new Error(`Wayback API HTTP ${apiRes.status}`);
+    const contentType = apiRes.headers.get('content-type') || '';
+    if (!contentType.includes('json')) throw new Error('Wayback API returned non-JSON payload');
+
     const apiData = await apiRes.json();
     const snapshotUrl = apiData?.archived_snapshots?.closest?.url;
     if (!snapshotUrl) throw new Error('No Wayback snapshot available');
