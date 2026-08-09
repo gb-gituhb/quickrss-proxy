@@ -349,19 +349,16 @@ function resolveBpcStrategy(targetUrl) {
   const siteRule = findSiteRule(hostname, bpcRules.sitesMap);
   const forceStripImages = siteRule?.stripImages === true;
 
-  let userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
-  let referer = '';
+  // Default universally to Googlebot UA & Google Referer for pre-rendered SEO markup on free news sites
+  let userAgent = 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)';
+  let referer = 'https://www.google.com/';
 
+  // Override if siteRule explicitly demands custom headers
   if (siteRule?.useragent) {
     userAgent = siteRule.useragent;
-  } else if (isBpcDomain) {
-    userAgent = 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)';
   }
-
   if (siteRule?.referer) {
     referer = siteRule.referer;
-  } else if (isBpcDomain) {
-    referer = 'https://www.google.com/';
   }
 
   const bpcHeaders = {
@@ -513,7 +510,7 @@ async function executePipeline(targetUrl, signal, stripImages = false, debug = f
     }
   }
 
-  // Only cache as temporary error if not aborted by global timeout
+  // Only write to errorCache if the failure was not due to an abort signal
   if (!signal?.aborted) {
     errorCache.set(cacheKey, true);
   }
