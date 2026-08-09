@@ -37,7 +37,7 @@ app.get('/extract', async (req, res) => {
       return res.status(500).send('Failed to extract article body.');
     }
 
-    // Clean, high-contrast Kindle E-Ink HTML layout
+    // Clean, high-contrast Kindle E-Ink HTML layout with Charis SIL font
     const cleanDocument = `
       <!DOCTYPE html>
       <html>
@@ -48,7 +48,7 @@ app.get('/extract', async (req, res) => {
         <base href="${targetUrl}">
         <style>
           body {
-            font-family: Georgia, "Times New Roman", serif;
+            font-family: "Charis SIL", CharisSIL, Charis, Georgia, "Times New Roman", serif;
             line-height: 1.6;
             max-width: 680px;
             margin: 0 auto;
