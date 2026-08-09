@@ -1,4 +1,5 @@
 const express = require('express');
+const compression = require('compression');
 const { Readability } = require('@mozilla/readability');
 const { parseHTML } = require('linkedom');
 const { marked } = require('marked');
@@ -6,6 +7,41 @@ const { marked } = require('marked');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const JINA_API_KEY = process.env.JINA_API_KEY || '';
+
+// Compression middleware (reduces payload size for KOReader/Kindle)
+app.use(compression());
+
+// In-memory LRU Cache (200 articles, 1-hour TTL)
+class SimpleLRUCache {
+    constructor(limit = 200, ttlMs = 60 * 60 * 1000) {
+        this.limit = limit;
+        this.ttlMs = ttlMs;
+        this.cache = new Map();
+    }
+
+    get(key) {
+        const item = this.cache.get(key);
+        if (!item) return null;
+        if (Date.now() > item.expiresAt) {
+            this.cache.delete(key);
+            return null;
+        }
+        this.cache.delete(key);
+        this.cache.set(key, item);
+        return item.value;
+    }
+
+    set(key, value) {
+        if (this.cache.has(key)) this.cache.delete(key);
+        else if (this.cache.size >= this.limit) {
+            const oldestKey = this.cache.keys().next().value;
+            this.cache.delete(oldestKey);
+        }
+        this.cache.set(key, { value, expiresAt: Date.now() + this.ttlMs });
+    }
+}
+
+const articleCache = new SimpleLRUCache(200, 60 * 60 * 1000);
 
 // Clean out QuickRSS tracking prefixes, trailing quotes, and extract valid URLs
 function sanitizeUrl(rawUrl) {
@@ -17,12 +53,12 @@ function sanitizeUrl(rawUrl) {
     return match ? match[1] : null;
 }
 
-// DOM-based image sanitizer: fixes lazy loading, resolves relative URLs, strips srcset & tracking pixels
+// DOM-based image sanitizer with explicit DOM memory cleanup
 function sanitizeImages(htmlContent, targetUrl) {
     if (!htmlContent) return '';
-    
+    let dom = null;
     try {
-        const dom = parseHTML(`<div>${htmlContent}</div>`);
+        dom = parseHTML(`<div>${htmlContent}</div>`);
         const doc = dom.window.document;
         const imgs = doc.querySelectorAll('img');
 
@@ -61,6 +97,11 @@ function sanitizeImages(htmlContent, targetUrl) {
         return doc.body.firstElementChild ? doc.body.firstElementChild.innerHTML : htmlContent;
     } catch (e) {
         return htmlContent;
+    } finally {
+        if (dom && dom.window && typeof dom.window.close === 'function') {
+            dom.window.close();
+        }
+        dom = null;
     }
 }
 
@@ -105,11 +146,12 @@ function getJinaHeaders() {
     return headers;
 }
 
-// Universal Content Quality Gate (Works across ALL domains dynamically)
+// Universal Content Quality Gate with sliced scanning window (prevents ReDoS/CPU lockup)
 function isValidContent(htmlContent) {
     if (!htmlContent) return false;
 
-    const plainText = htmlContent.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    const scanWindow = htmlContent.length > 150000 ? htmlContent.slice(0, 150000) : htmlContent;
+    const plainText = scanWindow.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
     const lower = plainText.toLowerCase();
     
     // 1. Rejects anti-bot error pages
@@ -134,56 +176,59 @@ function isValidContent(htmlContent) {
         return false;
     }
 
-    // 3. Universal Word & Paragraph Threshold
-    // Real articles are almost never under 180 words or fewer than 2 paragraphs.
+    // 3. Word & Paragraph Threshold
     const wordCount = plainText.split(/\s+/).filter(Boolean).length;
-    const paragraphCount = (htmlContent.match(/<p[\s>]/gi) || []).length;
+    const paragraphCount = (scanWindow.match(/<p[\s>]/gi) || []).length;
 
-    if (wordCount < 180 || paragraphCount < 2) {
-        return false;
-    }
-
-    return true;
+    return !(wordCount < 180 || paragraphCount < 2);
 }
 
-// Tier 1: Direct Fetch (3s Snappy Timeout)
+// Tier 1: Direct Fetch (2.5s Timeout)
 async function fetchDirect(targetUrl) {
-    const response = await fetch(targetUrl, {
-        headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Referer': 'https://www.google.com/'
-        },
-        signal: AbortSignal.timeout(3000)
-    });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const html = await response.text();
+    let dom = null;
+    try {
+        const response = await fetch(targetUrl, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Referer': 'https://www.google.com/'
+            },
+            signal: AbortSignal.timeout(2500)
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const html = await response.text();
 
-    const dom = parseHTML(html);
-    const doc = dom?.window?.document;
-    if (!doc || !doc.documentElement) throw new Error('Invalid DOM structure');
+        dom = parseHTML(html);
+        const doc = dom?.window?.document;
+        if (!doc || !doc.documentElement) throw new Error('Invalid DOM structure');
 
-    if (doc.head) {
-        const base = doc.createElement('base');
-        base.href = targetUrl;
-        doc.head.appendChild(base);
+        if (doc.head) {
+            const base = doc.createElement('base');
+            base.href = targetUrl;
+            doc.head.appendChild(base);
+        }
+
+        const reader = new Readability(doc);
+        const article = reader.parse();
+
+        if (!article || !article.content || !isValidContent(article.content)) {
+            throw new Error('Tier 1 content invalid or incomplete');
+        }
+        return buildKindleHTML(article.title, article.content, targetUrl);
+    } finally {
+        if (dom && dom.window && typeof dom.window.close === 'function') {
+            dom.window.close();
+        }
+        dom = null;
     }
-
-    const reader = new Readability(doc);
-    const article = reader.parse();
-
-    if (!article || !article.content || !isValidContent(article.content)) {
-        throw new Error('Tier 1 content invalid or incomplete (triggered quality gate)');
-    }
-    return buildKindleHTML(article.title, article.content, targetUrl);
 }
 
-// Tier 2: Live Anti-Bot Middleware (10s Timeout)
+// Tier 2: Live Anti-Bot Middleware (6s Timeout)
 async function fetchViaLiveMiddleware(targetUrl) {
     const response = await fetch(`https://r.jina.ai/${targetUrl}`, {
         headers: getJinaHeaders(),
-        signal: AbortSignal.timeout(10000)
+        signal: AbortSignal.timeout(6000)
     });
     if (!response.ok) throw new Error(`Jina Live HTTP ${response.status}`);
     
@@ -196,12 +241,12 @@ async function fetchViaLiveMiddleware(targetUrl) {
     return buildKindleHTML(json.data.title || 'Article', htmlContent, targetUrl);
 }
 
-// Tier 3: archive.ph via Middleware (12s Timeout)
+// Tier 3: archive.ph via Middleware (7s Timeout)
 async function fetchViaArchivePh(targetUrl) {
     const archivePhUrl = `https://archive.ph/newest/${targetUrl}`;
     const response = await fetch(`https://r.jina.ai/${archivePhUrl}`, {
         headers: getJinaHeaders(),
-        signal: AbortSignal.timeout(12000)
+        signal: AbortSignal.timeout(7000)
     });
     if (!response.ok) throw new Error(`archive.ph HTTP ${response.status}`);
 
@@ -214,10 +259,10 @@ async function fetchViaArchivePh(targetUrl) {
     return buildKindleHTML(json.data.title || 'Archived Article', htmlContent, targetUrl);
 }
 
-// Tier 4: Wayback Machine Fallback (5s Timeout)
+// Tier 4: Wayback Machine Fallback (4s Timeout)
 async function fetchViaWayback(targetUrl) {
     const apiRes = await fetch(`https://archive.org/wayback/available?url=${encodeURIComponent(targetUrl)}`, {
-        signal: AbortSignal.timeout(5000)
+        signal: AbortSignal.timeout(4000)
     });
     if (!apiRes.ok) throw new Error(`Wayback API HTTP ${apiRes.status}`);
 
@@ -228,7 +273,42 @@ async function fetchViaWayback(targetUrl) {
     return await fetchDirect(snapshotUrl);
 }
 
-// Health Check Route
+// Hedged pipeline execution
+async function executePipeline(targetUrl) {
+    // 1. Check LRU Cache
+    const cachedHtml = articleCache.get(targetUrl);
+    if (cachedHtml) {
+        return cachedHtml;
+    }
+
+    const timeoutPromise = (ms) => new Promise((_, reject) => setTimeout(() => reject(new Error('Hedge delay elapsed')), ms));
+
+    // Speculative Execution: Attempt Tier 1 with a 1.2s delay guard
+    try {
+        const result = await Promise.race([
+            fetchDirect(targetUrl),
+            timeoutPromise(1200)
+        ]);
+        articleCache.set(targetUrl, result);
+        return result;
+    } catch (_) {
+        // Tier 1 took too long or failed; proceed to sequential fallbacks
+    }
+
+    for (const tierFn of [fetchViaLiveMiddleware, fetchViaArchivePh, fetchViaWayback]) {
+        try {
+            const html = await tierFn(targetUrl);
+            articleCache.set(targetUrl, html);
+            return html;
+        } catch (_) {
+            continue;
+        }
+    }
+
+    throw new Error('Failed to extract article content across all pipelines.');
+}
+
+// Health Check Route (kept warm by uptime pingers)
 app.get('/health', (req, res) => res.status(200).send('OK'));
 
 // Main Extraction Route
@@ -240,27 +320,10 @@ app.get('/extract', async (req, res) => {
     if (!targetUrl) return res.status(400).send('Invalid URL provided.');
 
     try {
-        return res.send(await fetchDirect(targetUrl));
-    } catch (e1) {
-        console.warn(`[Tier 1 Failed] ${targetUrl}: ${e1.message}. Falling over to Tier 2 (Jina)...`);
-    }
-
-    try {
-        return res.send(await fetchViaLiveMiddleware(targetUrl));
-    } catch (e2) {
-        console.warn(`[Tier 2 Failed] ${targetUrl}: ${e2.message}. Falling over to Tier 3 (archive.ph)...`);
-    }
-
-    try {
-        return res.send(await fetchViaArchivePh(targetUrl));
-    } catch (e3) {
-        console.warn(`[Tier 3 Failed] ${targetUrl}: ${e3.message}. Falling over to Tier 4 (Wayback)...`);
-    }
-
-    try {
-        return res.send(await fetchViaWayback(targetUrl));
-    } catch (e4) {
-        console.error(`[Tier 4 Failed] ${targetUrl}: ${e4.message}`);
+        const result = await executePipeline(targetUrl);
+        return res.send(result);
+    } catch (err) {
+        console.error(`[Extraction Failed] ${targetUrl}: ${err.message}`);
         return res.status(500).send('Failed to extract content across all tiers.');
     }
 });
