@@ -1,16 +1,19 @@
 {
-  "name": "kindle-bpc-proxy",
+  "name": "quickrss-proxy",
   "version": "1.0.0",
-  "description": "Lightweight article extraction proxy with BPC rules for Kindle and e-readers",
+  "description": "QuickRSS Proxy server with Bypass Paywalls Clean rules compiler",
   "main": "server.js",
   "scripts": {
     "build": "node build-bpc-rules.js",
-    "start": "node server.js"
+    "start": "node build-bpc-rules.js && node server.js",
+    "dev": "nodemon -e js,json --watch bpc-extension --exec \"npm run start\""
   },
   "dependencies": {
-    "@mozilla/readability": "^0.5.0",
-    "express": "^4.19.2",
-    "linkedom": "^0.16.11"
+    "cors": "^2.8.5",
+    "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
   },
   "engines": {
     "node": ">=18.0.0"
