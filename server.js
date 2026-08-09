@@ -8,6 +8,8 @@ const PORT = process.env.PORT || 3000;
 const JINA_API_KEY = process.env.JINA_API_KEY || '';
 const AUTH_TOKEN = process.env.AUTH_TOKEN || '';
 
+const GOOGLEBOT_UA = 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)';
+
 class SimpleLRUCache {
     constructor(limit = 200, ttlMs = 60 * 60 * 1000) {
         this.limit = limit;
@@ -85,16 +87,15 @@ function sanitizeUrl(rawUrl) {
     return null;
 }
 
-// Strictly detects raw HTML that is a JS SPA shell, cookie consent banner, or paywall wrapper
 function isJsAppShell(rawHtml) {
     if (!rawHtml) return true;
     const lower = rawHtml.toLowerCase();
 
-    // Rejects common JS consent/app shell wrappers seen on Guardian, BBC, and top news sites
     const shellIndicators = [
         'gu-cmp-v2', 'guardian-page-skin', 'bbc-privacy-banner', 
         'consent-banner', 'sp_message_container', 'js-article-body',
-        'enable javascript to view', 'please turn on javascript'
+        'enable javascript to view', 'please turn on javascript',
+        'onetrust-consent-sdk', 'choice-consent'
     ];
     if (shellIndicators.some(indicator => lower.includes(indicator))) {
         return true;
@@ -119,11 +120,9 @@ function sanitizeContent(htmlContent, targetUrl, stripAllImages = false) {
         dom = parseHTML(`<div>${htmlContent}</div>`);
         const doc = dom.window.document;
 
-        // 1. Purge active elements, style blocks, and tracker tags
         const badTags = doc.querySelectorAll('script, style, iframe, object, embed, form, noscript, svg, canvas, source');
         badTags.forEach(el => el.remove());
 
-        // 2. Strip inline style attributes
         const styledElements = doc.querySelectorAll('[style]');
         styledElements.forEach(el => el.removeAttribute('style'));
 
@@ -133,27 +132,34 @@ function sanitizeContent(htmlContent, targetUrl, stripAllImages = false) {
             imgs.forEach(img => img.remove());
         } else {
             let imageCount = 0;
-            const MAX_IMAGES = 5;
+            const MAX_IMAGES = 3;
+
+            const thumbnailPattern = /thumb|avatar|icon|logo|profile|banner|100x|150x|200x|300x|small|tile|poster/i;
 
             imgs.forEach(img => {
-                if (imageCount >= MAX_IMAGES) {
-                    img.remove();
-                    return;
-                }
-
                 const realSrc = img.getAttribute('data-src') || 
                                 img.getAttribute('data-original') || 
                                 img.getAttribute('data-lazy-src') || 
-                                img.getAttribute('src');
+                                img.getAttribute('src') || '';
 
-                if (!realSrc || realSrc.startsWith('data:') || realSrc.includes('tracking') || realSrc.includes('pixel')) {
+                const altText = img.getAttribute('alt') || '';
+
+                if (
+                    !realSrc || 
+                    realSrc.startsWith('data:') || 
+                    realSrc.includes('tracking') || 
+                    realSrc.includes('pixel') ||
+                    thumbnailPattern.test(realSrc) ||
+                    thumbnailPattern.test(altText) ||
+                    imageCount >= MAX_IMAGES
+                ) {
                     img.remove();
                     return;
                 }
 
                 const width = img.getAttribute('width');
                 const height = img.getAttribute('height');
-                if ((width === '1' || width === '0') && (height === '1' || height === '0')) {
+                if ((width && parseInt(width) < 250) || (height && parseInt(height) < 250)) {
                     img.remove();
                     return;
                 }
@@ -165,6 +171,7 @@ function sanitizeContent(htmlContent, targetUrl, stripAllImages = false) {
                         return;
                     }
                     img.setAttribute('src', absUrl);
+                    img.setAttribute('loading', 'lazy');
                     imageCount++;
                 } catch (_) {
                     img.remove();
@@ -175,7 +182,6 @@ function sanitizeContent(htmlContent, targetUrl, stripAllImages = false) {
                 img.removeAttribute('data-original');
                 img.removeAttribute('data-lazy-src');
                 img.removeAttribute('srcset');
-                img.removeAttribute('loading');
                 img.removeAttribute('decoding');
                 img.removeAttribute('sizes');
             });
@@ -219,7 +225,7 @@ function buildKindleHTML(title, content, targetUrl = '', stripAllImages = false)
             background-color: #fff;
             margin: 0 auto;
             padding: 14px;
-            font-size: 1.25rem; /* ~25px base font size for ultra-legible E-ink reading */
+            font-size: 1.25rem; /* ~25px base font size */
             word-wrap: break-word;
         }
         h1 { font-size: 2rem; line-height: 1.25; margin-bottom: 0.6rem; font-weight: bold; }
@@ -239,7 +245,11 @@ function buildKindleHTML(title, content, targetUrl = '', stripAllImages = false)
 }
 
 function getJinaHeaders() {
-    const headers = { 'Accept': 'application/json', 'X-No-Cache': 'true' };
+    const headers = { 
+        'Accept': 'application/json', 
+        'X-No-Cache': 'true',
+        'X-User-Agent': GOOGLEBOT_UA
+    };
     if (JINA_API_KEY) headers['Authorization'] = `Bearer ${JINA_API_KEY}`;
     return headers;
 }
@@ -259,8 +269,25 @@ function isValidContent(htmlContent) {
     const scanWindow = htmlContent.length > 150000 ? htmlContent.slice(0, 150000) : htmlContent;
     const plainText = scanWindow.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
     const lower = plainText.toLowerCase();
+
+    // Rejects cookie banners that slipped through Readability
+    const consentPhrases = [
+        'cookies on the bbc website',
+        'notice: the guardian uses cookies',
+        'welcome to bbc.com',
+        'about our privacy and cookies',
+        'we use cookies to give you',
+        'accept all cookies',
+        'agree to our use of cookies',
+        'choice.consent',
+        'onetrust-consent-sdk',
+        'manage choices'
+    ];
+    if (consentPhrases.some(phrase => lower.includes(phrase))) {
+        return false;
+    }
     
-    // 1. Hard error / Captcha rejection
+    // Anti-bot / Captcha rejection
     const hardErrors = [
         'captcha', 'enable javascript', 'access denied', 
         'security check', 'just a moment...', 'pardon our interruption',
@@ -270,7 +297,7 @@ function isValidContent(htmlContent) {
         return false;
     }
 
-    // 2. Truncation & Paywall Teaser Detection (< 450 words with trigger phrases)
+    // Truncation & Paywall Teaser Detection (< 450 words with trigger phrases)
     const wordCount = plainText.split(/\s+/).filter(Boolean).length;
     const truncationMarkers = [
         'continue reading', 'read full story', 'read full article', 
@@ -283,18 +310,85 @@ function isValidContent(htmlContent) {
         return false;
     }
 
-    // 3. Minimum Content Threshold
+    // Minimum Content Threshold (At least 250 words and 2 paragraphs)
     const paragraphCount = (scanWindow.match(/<p[\s>]/gi) || []).length;
     return !(wordCount < 250 || paragraphCount < 2);
 }
 
-// Tier 1: Direct Fetch (2.5s)
+// Fallback 1: Extract full article text directly from JSON-LD schema (BBC, Guardian, NYT)
+function extractFromJSONLD(doc) {
+    try {
+        const scripts = doc.querySelectorAll('script[type="application/ld+json"]');
+        for (const script of scripts) {
+            if (!script.textContent) continue;
+            let data = null;
+            try {
+                data = JSON.parse(script.textContent);
+            } catch (_) { continue; }
+
+            const items = Array.isArray(data) ? data : [data];
+            for (const item of items) {
+                const graph = item['@graph'] || [item];
+                for (const node of graph) {
+                    if (node && node.articleBody && typeof node.articleBody === 'string' && node.articleBody.length > 400) {
+                        const title = node.headline || node.name || '';
+                        const paragraphs = node.articleBody
+                            .split(/\n+/)
+                            .map(p => p.trim())
+                            .filter(p => p.length > 20)
+                            .map(p => `<p>${escapeHtml(p)}</p>`)
+                            .join('');
+                        return { title, content: paragraphs };
+                    }
+                }
+            }
+        }
+    } catch (_) {}
+    return null;
+}
+
+// Fallback 2: Extract paragraphs directly targeting BBC, Guardian, and React CSS designs
+function extractFromDOMParagraphs(doc) {
+    try {
+        const selectors = [
+            'main p', 'article p', 
+            '[data-component="text-block"]', 
+            '[class*="article-body"] p', 
+            '[class*="Paragraph"] p', 
+            '#maincontent p'
+        ];
+        const nodes = doc.querySelectorAll(selectors.join(', '));
+        const paragraphs = [];
+
+        nodes.forEach(node => {
+            const text = node.textContent ? node.textContent.trim() : '';
+            const lower = text.toLowerCase();
+            if (
+                text.length > 30 && 
+                !lower.includes('cookie') && 
+                !lower.includes('privacy policy') &&
+                !lower.includes('terms of use')
+            ) {
+                paragraphs.push(`<p>${escapeHtml(text)}</p>`);
+            }
+        });
+
+        if (paragraphs.length >= 3) {
+            const titleNode = doc.querySelector('h1');
+            const title = titleNode ? titleNode.textContent.trim() : '';
+            return { title, content: paragraphs.join('') };
+        }
+    } catch (_) {}
+    return null;
+}
+
+// Tier 1: Direct Fetch with Googlebot User-Agent + Schema & Fallback Extractors
 async function fetchDirect(targetUrl, parentSignal, stripImages = false) {
     let dom = null;
     try {
         const response = await fetch(targetUrl, {
             headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                'User-Agent': GOOGLEBOT_UA,
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                 'Accept-Language': 'en-US,en;q=0.5'
             },
@@ -317,13 +411,37 @@ async function fetchDirect(targetUrl, parentSignal, stripImages = false) {
             doc.head.appendChild(base);
         }
 
+        // Strategy A: Standard Readability
+        let extractedTitle = '';
+        let extractedContent = '';
+
         const reader = new Readability(doc);
         const article = reader.parse();
 
-        if (!article || !article.content || !isValidContent(article.content)) {
-            throw new Error('Tier 1 content invalid or incomplete');
+        if (article && article.content && isValidContent(article.content)) {
+            extractedTitle = article.title;
+            extractedContent = article.content;
+        } else {
+            // Strategy B: Structured JSON-LD Metadata (BBC/Guardian)
+            const jsonLdResult = extractFromJSONLD(doc);
+            if (jsonLdResult && isValidContent(jsonLdResult.content)) {
+                extractedTitle = jsonLdResult.title;
+                extractedContent = jsonLdResult.content;
+            } else {
+                // Strategy C: Target-Specific DOM Paragraph Queries
+                const domResult = extractFromDOMParagraphs(doc);
+                if (domResult && isValidContent(domResult.content)) {
+                    extractedTitle = domResult.title;
+                    extractedContent = domResult.content;
+                }
+            }
         }
-        return buildKindleHTML(article.title, article.content, targetUrl, stripImages);
+
+        if (!extractedContent || !isValidContent(extractedContent)) {
+            throw new Error('Tier 1 content invalid or incomplete across all strategies');
+        }
+
+        return buildKindleHTML(extractedTitle, extractedContent, targetUrl, stripImages);
     } finally {
         if (dom && dom.window && typeof dom.window.close === 'function') {
             dom.window.close();
