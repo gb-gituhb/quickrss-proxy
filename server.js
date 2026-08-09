@@ -10,6 +10,19 @@ const PORT = process.env.PORT || 3000;
 const JINA_API_KEY = process.env.JINA_API_KEY || '';
 const AUTH_TOKEN = process.env.AUTH_TOKEN || '';
 
+// Hardcoded fallback: domains that should always use archive-first routing
+// regardless of what the BPC build script produces
+const HARDCODED_ARCHIVE_DOMAINS = new Set([
+  'economist.com',
+  'ft.com',
+  'bloomberg.com',
+  'barrons.com',
+  'wsj.com',
+  'nytimes.com',
+  'washingtonpost.com',
+  'theatlantic.com'
+]);
+
 // Load BPC rules compiled from bpc-extension
 const rulesPath = path.join(__dirname, 'bpc-rules.json');
 let bpcRules = { sitesMap: {}, domains: new Set(), archiveDomains: new Set() };
@@ -27,6 +40,9 @@ if (fs.existsSync(rulesPath)) {
     console.warn('[BPC RULE ENGINE] Warning: Failed to parse bpc-rules.json');
   }
 }
+
+// Merge hardcoded fallback into loaded rules
+HARDCODED_ARCHIVE_DOMAINS.forEach(d => bpcRules.archiveDomains.add(d));
 
 // Subdomain-depth lookup against Set
 function matchesDomainSet(hostname, domainSet) {
@@ -510,7 +526,7 @@ async function fetchViaGhostArchive(targetUrl, bpcConfig, parentSignal, stripIma
 
 async function fetchViaWayback(targetUrl, bpcConfig, parentSignal, stripImages = false) {
   const apiRes = await fetch(`https://archive.org/wayback/available?url=${encodeURIComponent(targetUrl)}`, {
-    signal: getCombinedSignal(4000, parentSignal)
+    signal: getCombinedSignal(6000, parentSignal)
   });
   if (!apiRes.ok) throw new Error(`Wayback API HTTP ${apiRes.status}`);
 
@@ -569,7 +585,8 @@ app.get('/', (req, res) => {
   res.json({
     service: 'quickrss-proxy',
     status: 'online',
-    bpc_rules_loaded: bpcRules.domains.size || 0
+    bpc_rules_loaded: bpcRules.domains.size || 0,
+    hardcoded_archive_domains: HARDCODED_ARCHIVE_DOMAINS.size
   });
 });
 
