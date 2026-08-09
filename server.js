@@ -1,3 +1,4 @@
+// server.js
 const express = require('express');
 const { Readability } = require('@mozilla/readability');
 const { parseHTML } = require('linkedom');
@@ -11,7 +12,6 @@ const PORT = process.env.PORT || 3000;
 const JINA_API_KEY = process.env.JINA_API_KEY || '';
 const AUTH_TOKEN = process.env.AUTH_TOKEN || '';
 
-// Hardcoded fallback: domains that should always use archive-first routing
 const HARDCODED_ARCHIVE_DOMAINS = new Set([
   'economist.com',
   'ft.com',
@@ -23,7 +23,6 @@ const HARDCODED_ARCHIVE_DOMAINS = new Set([
   'theatlantic.com'
 ]);
 
-// Load BPC rules compiled from bpc-extension
 const rulesPath = path.join(__dirname, 'bpc-rules.json');
 let bpcRules = { sitesMap: {}, domains: new Set(), archiveDomains: new Set() };
 
@@ -41,10 +40,8 @@ if (fs.existsSync(rulesPath)) {
   }
 }
 
-// Merge hardcoded fallback into loaded rules
 HARDCODED_ARCHIVE_DOMAINS.forEach(d => bpcRules.archiveDomains.add(d));
 
-// Subdomain-depth lookup against Set
 function matchesDomainSet(hostname, domainSet) {
   if (!hostname || !(domainSet instanceof Set)) return false;
   if (domainSet.has(hostname)) return true;
@@ -57,7 +54,6 @@ function matchesDomainSet(hostname, domainSet) {
   return false;
 }
 
-// Subdomain-depth lookup for site configuration rules (Non-mutating)
 function findSiteRule(hostname, sitesMap = {}) {
   if (!hostname || !sitesMap) return null;
   if (sitesMap[hostname]) return sitesMap[hostname];
@@ -69,10 +65,6 @@ function findSiteRule(hostname, sitesMap = {}) {
   }
   return null;
 }
-
-// ==========================================
-// IN-MEMORY LRU CACHE
-// ==========================================
 
 class SimpleLRUCache {
   constructor(limit = 200, ttlMs = 60 * 60 * 1000) {
@@ -105,10 +97,6 @@ class SimpleLRUCache {
 
 const articleCache = new SimpleLRUCache(200, 60 * 60 * 1000);
 const errorCache = new SimpleLRUCache(100, 5 * 60 * 1000);
-
-// ==========================================
-// MIDDLEWARE & SANITIZATION HELPERS
-// ==========================================
 
 app.use((req, res, next) => {
   if (req.path === '/health' || req.path === '/') return next();
@@ -179,7 +167,6 @@ function sanitizeContent(htmlContent, targetUrl, stripAllImages = false) {
     const badTags = doc.querySelectorAll('script, style, iframe, object, embed, form, noscript, svg, canvas, source');
     badTags.forEach(el => el.remove());
 
-    // Security Hardening: Strip inline styling and on* event attributes
     const allElements = doc.querySelectorAll('*');
     allElements.forEach(el => {
       el.removeAttribute('style');
@@ -264,12 +251,6 @@ function sanitizeContent(htmlContent, targetUrl, stripAllImages = false) {
   }
 }
 
-// ==========================================
-// OUTPUT FORMATTERS
-// ==========================================
-
-// QuickRSS-compatible HTML: structural CSS only, no font-size locks.
-// Uses 'em' units so spacing scales with QuickRSS's font size controls.
 function buildQuickRSSHTML(title, content, targetUrl = '', stripAllImages = false) {
   const cleanedContent = targetUrl ? sanitizeContent(content, targetUrl, stripAllImages) : content;
   const safeTitle = escapeHtml(title || 'Untitled');
@@ -280,19 +261,9 @@ function buildQuickRSSHTML(title, content, targetUrl = '', stripAllImages = fals
     <meta charset="UTF-8">
     <title>${safeTitle}</title>
     <style>
-        /* Structural styles only — QuickRSS controls font family and size */
-        body {
-            line-height: 1.6;
-            word-wrap: break-word;
-        }
-        h1 {
-            line-height: 1.3;
-            margin-bottom: 0.4em;
-        }
-        p {
-            margin-bottom: 1.2em;
-            text-align: justify;
-        }
+        body { line-height: 1.6; word-wrap: break-word; }
+        h1 { line-height: 1.3; margin-bottom: 0.4em; }
+        p { margin-bottom: 1.2em; text-align: justify; }
         img { max-width: 100%; height: auto; display: block; margin: 1em auto; }
         a { color: inherit; text-decoration: underline; }
         blockquote { border-left: 3px solid #000; padding-left: 12px; margin-left: 0; }
@@ -309,7 +280,6 @@ function buildQuickRSSHTML(title, content, targetUrl = '', stripAllImages = fals
 </html>`;
 }
 
-// Legacy Kindle HTML with embedded styling (for non-QuickRSS clients)
 function buildKindleHTML(title, content, targetUrl = '', stripAllImages = false) {
   const cleanedContent = targetUrl ? sanitizeContent(content, targetUrl, stripAllImages) : content;
   const safeTitle = escapeHtml(title || 'Untitled');
@@ -354,8 +324,7 @@ async function buildEpub(title, content, targetUrl = '', stripAllImages = false)
   const safeTitle = escapeHtml(title || 'Untitled');
   const id = 'id-' + Math.random().toString(36).slice(2);
 
-  const css = `/* EPUB Styles */
-body { font-family: 'Charis SIL', Georgia, serif; line-height: 1.6; }
+  const css = `body { font-family: 'Charis SIL', Georgia, serif; line-height: 1.6; }
 img { max-width: 100%; height: auto; display: block; margin: 15px auto; }
 a { color: #000; text-decoration: underline; }
 blockquote { border-left: 3px solid #000; padding-left: 12px; margin-left: 0; }
@@ -475,10 +444,6 @@ function isValidContent(htmlContent) {
   return !(wordCount < 200 || paragraphCount < 2);
 }
 
-// ==========================================
-// BPC RULE STRATEGY RESOLVER
-// ==========================================
-
 function resolveBpcStrategy(targetUrl) {
   let hostname = '';
   try {
@@ -525,10 +490,6 @@ function resolveBpcStrategy(targetUrl) {
     pipelineSequence
   };
 }
-
-// ==========================================
-// FETCH TIERS
-// ==========================================
 
 async function fetchDirect(targetUrl, bpcConfig, parentSignal, stripImages = false) {
   let dom = null;
@@ -656,10 +617,6 @@ async function fetchViaWayback(targetUrl, bpcConfig, parentSignal, stripImages =
   return await fetchDirect(snapshotUrl, bpcConfig, parentSignal, stripImages);
 }
 
-// ==========================================
-// PIPELINE EXECUTION
-// ==========================================
-
 async function executePipeline(targetUrl, signal, stripImages = false, debug = false) {
   const bpcConfig = resolveBpcStrategy(targetUrl);
   const effectiveStripImages = stripImages || bpcConfig.forceStripImages;
@@ -692,10 +649,6 @@ async function executePipeline(targetUrl, signal, stripImages = false, debug = f
 
   throw new Error('Failed to extract article content across all pipelines.');
 }
-
-// ==========================================
-// ROUTES
-// ==========================================
 
 app.get('/health', (req, res) => res.status(200).send('OK'));
 
