@@ -1,5 +1,4 @@
 const express = require('express');
-const compression = require('compression');
 const { Readability } = require('@mozilla/readability');
 const { parseHTML } = require('linkedom');
 const { marked } = require('marked');
@@ -7,9 +6,6 @@ const { marked } = require('marked');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const JINA_API_KEY = process.env.JINA_API_KEY || '';
-
-// Compression middleware (reduces payload size for KOReader/Kindle)
-app.use(compression());
 
 // In-memory LRU Cache (200 articles, 1-hour TTL)
 class SimpleLRUCache {
@@ -308,7 +304,7 @@ async function executePipeline(targetUrl) {
     throw new Error('Failed to extract article content across all pipelines.');
 }
 
-// Health Check Route (kept warm by uptime pingers)
+// Health Check Route
 app.get('/health', (req, res) => res.status(200).send('OK'));
 
 // Main Extraction Route
