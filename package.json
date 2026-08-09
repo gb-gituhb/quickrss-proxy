@@ -1,7 +1,7 @@
 {
   "name": "quickrss-proxy",
   "version": "1.0.0",
-  "description": "Auto-extracting readability proxy powered by upstream BPC rules",
+  "description": "Auto-extracting readability proxy powered by Jina AI Tier 1 and upstream BPC rules",
   "main": "server.js",
   "scripts": {
     "build": "node build-bpc-rules.js",
