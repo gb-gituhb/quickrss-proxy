@@ -20,7 +20,10 @@ const HARDCODED_ARCHIVE_DOMAINS = new Set([
   'wsj.com',
   'nytimes.com',
   'washingtonpost.com',
-  'theatlantic.com'
+  'theatlantic.com',
+  'spiegel.de',
+  'zeit.de',
+  'welt.de'
 ]);
 
 const rulesPath = path.join(__dirname, 'bpc-rules.json');
@@ -141,20 +144,6 @@ function sanitizeUrl(rawUrl) {
     } catch (_) {}
   }
   return null;
-}
-
-function isJsAppShell(rawHtml) {
-  if (!rawHtml) return true;
-  const stripped = rawHtml
-    .replace(/<script[\s\S]*?<\/script>/gi, '')
-    .replace(/<style[\s\S]*?<\/style>/gi, '')
-    .replace(/<svg[\s\S]*?<\/svg>/gi, '');
-
-  const bodyMatch = stripped.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
-  const bodyContent = bodyMatch ? bodyMatch[1] : stripped;
-  const textOnly = bodyContent.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-
-  return textOnly.length < 150;
 }
 
 function sanitizeContent(htmlContent, targetUrl, stripAllImages = false) {
@@ -455,30 +444,11 @@ function resolveBpcStrategy(targetUrl) {
   const siteRule = findSiteRule(hostname, bpcRules.sitesMap);
   const forceStripImages = siteRule?.stripImages === true;
 
-  let userAgent = 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)';
-  let referer = 'https://www.google.com/';
-
-  if (siteRule?.useragent) {
-    userAgent = siteRule.useragent;
-  }
-  if (siteRule?.referer) {
-    referer = siteRule.referer;
-  }
-
-  const bpcHeaders = {
-    'User-Agent': userAgent,
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.9'
-  };
-  if (referer) bpcHeaders['Referer'] = referer;
-
-  if (siteRule?.customHeaders) {
-    Object.assign(bpcHeaders, siteRule.customHeaders);
-  }
-
+  // Standard domains use Jina AI as Tier 1.
+  // Archive-forced domains bypass Jina AI and route straight to web archive mirrors.
   const pipelineSequence = isArchiveForced
-    ? [fetchViaLiveMiddleware, fetchViaArchivePh, fetchViaArchiveToday, fetchViaGhostArchive, fetchViaWayback, fetchDirect]
-    : [fetchDirect, fetchViaLiveMiddleware, fetchViaWayback];
+    ? [fetchViaArchivePh, fetchViaArchiveToday, fetchViaGhostArchive, fetchViaWayback]
+    : [fetchViaLiveMiddleware, fetchViaArchivePh, fetchViaWayback];
 
   return {
     hostname,
@@ -486,57 +456,19 @@ function resolveBpcStrategy(targetUrl) {
     isArchiveForced,
     siteRule,
     forceStripImages,
-    headers: bpcHeaders,
     pipelineSequence
   };
 }
 
-async function fetchDirect(targetUrl, bpcConfig, parentSignal, stripImages = false) {
-  let dom = null;
-  try {
-    const requestedTimeout = bpcConfig.siteRule?.timeoutMs || 2500;
-    const timeoutMs = Math.min(requestedTimeout, 4000);
-
-    const response = await fetch(targetUrl, {
-      headers: bpcConfig.headers,
-      signal: getCombinedSignal(timeoutMs, parentSignal)
-    });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const html = await response.text();
-
-    if (isJsAppShell(html)) {
-      throw new Error('Raw HTML is an unrendered JS application shell');
-    }
-
-    dom = parseHTML(html);
-    const doc = dom?.window?.document;
-    if (!doc || !doc.documentElement) throw new Error('Invalid DOM structure');
-
-    if (doc.head) {
-      const base = doc.createElement('base');
-      base.href = targetUrl;
-      doc.head.appendChild(base);
-    }
-
-    const reader = new Readability(doc);
-    const article = reader.parse();
-
-    if (!article || !article.content || !isValidContent(article.content)) {
-      throw new Error('Tier 1 content invalid or incomplete');
-    }
-    return { title: article.title, content: article.content, url: targetUrl };
-  } finally {
-    if (dom && dom.window && typeof dom.window.close === 'function') {
-      dom.window.close();
-    }
-    dom = null;
-  }
-}
-
 async function fetchViaLiveMiddleware(targetUrl, bpcConfig, parentSignal, stripImages = false) {
+  const headers = getJinaHeaders();
+  if (bpcConfig.siteRule?.useragent) {
+    headers['X-User-Agent'] = bpcConfig.siteRule.useragent;
+  }
+
   const response = await fetch(`https://r.jina.ai/${targetUrl}`, {
-    headers: getJinaHeaders(),
-    signal: getCombinedSignal(10000, parentSignal)
+    headers,
+    signal: getCombinedSignal(12000, parentSignal)
   });
   if (!response.ok) throw new Error(`Jina Live HTTP ${response.status}`);
 
@@ -614,7 +546,19 @@ async function fetchViaWayback(targetUrl, bpcConfig, parentSignal, stripImages =
   const snapshotUrl = apiData?.archived_snapshots?.closest?.url;
   if (!snapshotUrl) throw new Error('No Wayback snapshot available');
 
-  return await fetchDirect(snapshotUrl, bpcConfig, parentSignal, stripImages);
+  const response = await fetch(`https://r.jina.ai/${snapshotUrl}`, {
+    headers: getJinaHeaders(),
+    signal: getCombinedSignal(12000, parentSignal)
+  });
+  if (!response.ok) throw new Error(`Wayback Jina Fetch HTTP ${response.status}`);
+
+  const json = await response.json();
+  if (!json.data || !json.data.content) throw new Error('Wayback payload empty');
+
+  const htmlContent = await marked.parse(json.data.content);
+  if (!isValidContent(htmlContent)) throw new Error('Wayback snapshot invalid');
+
+  return { title: json.data.title || 'Archived Article', content: htmlContent, url: targetUrl };
 }
 
 async function executePipeline(targetUrl, signal, stripImages = false, debug = false) {
@@ -656,6 +600,7 @@ app.get('/', (req, res) => {
   res.json({
     service: 'quickrss-proxy',
     status: 'online',
+    tier1_provider: 'Jina AI',
     bpc_rules_loaded: bpcRules.domains.size || 0,
     hardcoded_archive_domains: HARDCODED_ARCHIVE_DOMAINS.size
   });
@@ -673,7 +618,7 @@ app.get('/extract', async (req, res) => {
   const format = req.query.format || 'html';
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 30000);
+  const timeout = setTimeout(() => controller.abort(), 35000);
 
   try {
     const article = await executePipeline(targetUrl, controller.signal, stripImages, debug);
