@@ -5,8 +5,9 @@ const { marked } = require('marked');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const JINA_API_KEY = process.env.JINA_API_KEY || ''; // Optional: Add key to Render Environment Variables
+const JINA_API_KEY = process.env.JINA_API_KEY || '';
 
+// Wrap content in Kindle Paperwhite Charis SIL typography
 function buildKindleHTML(title, content) {
     return `<!DOCTYPE html>
 <html lang="en">
@@ -15,8 +16,20 @@ function buildKindleHTML(title, content) {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>${title || 'Article'}</title>
     <style>
-        @font-face { font-family: 'Charis SIL'; src: local('Charis SIL'); }
-        body { font-family: 'Charis SIL', Georgia, serif; line-height: 1.6; color: #000; background-color: #fff; margin: 0 auto; max-width: 680px; padding: 15px; font-size: 1.1em; }
+        @font-face {
+            font-family: 'Charis SIL';
+            src: local('Charis SIL');
+        }
+        body {
+            font-family: 'Charis SIL', Georgia, serif;
+            line-height: 1.6;
+            color: #000;
+            background-color: #fff;
+            margin: 0 auto;
+            max-width: 680px;
+            padding: 15px;
+            font-size: 1.1em;
+        }
         h1 { font-size: 1.7em; margin-bottom: 0.2em; }
         img { max-width: 100%; height: auto; display: block; margin: 15px auto; }
         p { margin-bottom: 1.2em; text-align: justify; }
@@ -32,14 +45,12 @@ function buildKindleHTML(title, content) {
 </html>`;
 }
 
-// Helper: Common fetch settings for Jina API
 function getJinaHeaders() {
     const headers = { 'Accept': 'application/json' };
     if (JINA_API_KEY) headers['Authorization'] = `Bearer ${JINA_API_KEY}`;
     return headers;
 }
 
-// Helper: Validate content length and detect paywall/captcha stubs
 function isValidContent(text) {
     if (!text || text.length < 400) return false;
     const lower = text.toLowerCase();
@@ -47,10 +58,14 @@ function isValidContent(text) {
     return !errorKeywords.some(keyword => lower.includes(keyword));
 }
 
-// Tier 1: Direct Fetch (Original Site)
+// Tier 1: Direct Fetch (6s Timeout - Googlebot Referer + High TTFB Buffer)
 async function fetchDirect(targetUrl) {
     const response = await fetch(targetUrl, {
-        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36' }
+        headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            'Referer': 'https://www.google.com/'
+        },
+        signal: AbortSignal.timeout(6000)
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const html = await response.text();
@@ -70,9 +85,12 @@ async function fetchDirect(targetUrl) {
     return buildKindleHTML(article.title, article.content);
 }
 
-// Tier 2: Live Anti-Bot Middleware (Jina on Original Site)
+// Tier 2: Live Anti-Bot Middleware (18s Timeout - Generous buffer for JS rendering & Cloudflare)
 async function fetchViaLiveMiddleware(targetUrl) {
-    const response = await fetch(`https://r.jina.ai/${targetUrl}`, { headers: getJinaHeaders() });
+    const response = await fetch(`https://r.jina.ai/${targetUrl}`, {
+        headers: getJinaHeaders(),
+        signal: AbortSignal.timeout(18000)
+    });
     if (!response.ok) throw new Error(`Jina Live HTTP ${response.status}`);
     
     const json = await response.json();
@@ -84,10 +102,13 @@ async function fetchViaLiveMiddleware(targetUrl) {
     return buildKindleHTML(json.data.title || 'Article', htmlContent);
 }
 
-// Tier 3: archive.ph via Middleware (For hard paywalls)
+// Tier 3: archive.ph via Middleware (20s Timeout - Maximum buffer for archive redirects & heavy DOM)
 async function fetchViaArchivePh(targetUrl) {
     const archivePhUrl = `https://archive.ph/newest/${targetUrl}`;
-    const response = await fetch(`https://r.jina.ai/${archivePhUrl}`, { headers: getJinaHeaders() });
+    const response = await fetch(`https://r.jina.ai/${archivePhUrl}`, {
+        headers: getJinaHeaders(),
+        signal: AbortSignal.timeout(20000)
+    });
     if (!response.ok) throw new Error(`archive.ph HTTP ${response.status}`);
 
     const json = await response.json();
@@ -99,9 +120,11 @@ async function fetchViaArchivePh(targetUrl) {
     return buildKindleHTML(json.data.title || 'Archived Article', htmlContent);
 }
 
-// Tier 4: Wayback Machine Fallback
+// Tier 4: Wayback Machine Fallback (8s Timeout - Generous API check)
 async function fetchViaWayback(targetUrl) {
-    const apiRes = await fetch(`https://archive.org/wayback/available?url=${encodeURIComponent(targetUrl)}`);
+    const apiRes = await fetch(`https://archive.org/wayback/available?url=${encodeURIComponent(targetUrl)}`, {
+        signal: AbortSignal.timeout(8000)
+    });
     const apiData = await apiRes.json();
     const snapshotUrl = apiData?.archived_snapshots?.closest?.url;
     if (!snapshotUrl) throw new Error('No Wayback snapshot available');
@@ -109,12 +132,11 @@ async function fetchViaWayback(targetUrl) {
     return await fetchDirect(snapshotUrl);
 }
 
-// Main Extraction Route
+// Extraction Route
 app.get('/extract', async (req, res) => {
     const targetUrl = req.query.url;
     if (!targetUrl) return res.status(400).send('Missing url parameter');
 
-    // Cascade Attempts
     try {
         return res.send(await fetchDirect(targetUrl));
     } catch (e1) {
