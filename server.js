@@ -10,16 +10,49 @@ const PORT = process.env.PORT || 3000;
 const JINA_API_KEY = process.env.JINA_API_KEY || '';
 const AUTH_TOKEN = process.env.AUTH_TOKEN || '';
 
-// Load BPC rules compiled from bpc-extension/sites.js
+// Load BPC rules compiled from bpc-extension
 const rulesPath = path.join(__dirname, 'bpc-rules.json');
-let bpcRules = { sitesMap: {}, domains: [], archiveDomains: [] };
+let bpcRules = { sitesMap: {}, domains: new Set(), archiveDomains: new Set() };
+
 if (fs.existsSync(rulesPath)) {
   try {
-    bpcRules = JSON.parse(fs.readFileSync(rulesPath, 'utf-8'));
-    console.log(`[BPC LAYER 1] Loaded ${bpcRules.domains.length} rule entries.`);
+    const raw = JSON.parse(fs.readFileSync(rulesPath, 'utf-8'));
+    bpcRules = {
+      sitesMap: raw.sitesMap || {},
+      domains: new Set((raw.domains || []).map(d => d.toLowerCase())),
+      archiveDomains: new Set((raw.archiveDomains || []).map(d => d.toLowerCase()))
+    };
+    console.log(`[BPC RULE ENGINE] Loaded ${bpcRules.domains.size} domains (${bpcRules.archiveDomains.size} archive-flagged).`);
   } catch (err) {
-    console.warn('[BPC LAYER 1] Warning: Failed to parse bpc-rules.json');
+    console.warn('[BPC RULE ENGINE] Warning: Failed to parse bpc-rules.json');
   }
+}
+
+// O(k) Subdomain-depth lookup against Set
+function matchesDomainSet(hostname, domainSet) {
+  if (!hostname || !(domainSet instanceof Set)) return false;
+  if (domainSet.has(hostname)) return true;
+  
+  const parts = hostname.split('.');
+  while (parts.length > 1) {
+    parts.shift();
+    if (domainSet.has(parts.join('.'))) return true;
+  }
+  return false;
+}
+
+// O(k) Subdomain-depth lookup for site configuration rules
+function findSiteRule(hostname, sitesMap = {}) {
+  if (!hostname || !sitesMap) return null;
+  if (sitesMap[hostname]) return sitesMap[hostname];
+
+  const parts = hostname.split('.');
+  while (parts.length > 1) {
+    parts.shift();
+    const parentDomain = parts.join('.');
+    if (sitesMap[parentDomain]) return sitesMap[parentDomain];
+  }
+  return null;
 }
 
 // ==========================================
@@ -78,7 +111,7 @@ function escapeHtml(str) {
   return String(str)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
+    .replace(/\>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
 }
@@ -143,11 +176,6 @@ function sanitizeContent(htmlContent, targetUrl, stripAllImages = false) {
       const MAX_IMAGES = 5;
 
       imgs.forEach(img => {
-        if (imageCount >= MAX_IMAGES) {
-          img.remove();
-          return;
-        }
-
         const realSrc = img.getAttribute('data-src') ||
                         img.getAttribute('data-original') ||
                         img.getAttribute('data-lazy-src') ||
@@ -161,6 +189,11 @@ function sanitizeContent(htmlContent, targetUrl, stripAllImages = false) {
         const width = img.getAttribute('width');
         const height = img.getAttribute('height');
         if ((width === '1' || width === '0') && (height === '1' || height === '0')) {
+          img.remove();
+          return;
+        }
+
+        if (imageCount >= MAX_IMAGES) {
           img.remove();
           return;
         }
@@ -293,7 +326,7 @@ function isValidContent(htmlContent) {
 }
 
 // ==========================================
-// LAYER 1: BPC ENGINE & DISPATCHER
+// BPC RULE STRATEGY RESOLVER
 // ==========================================
 
 function resolveBpcStrategy(targetUrl) {
@@ -302,51 +335,66 @@ function resolveBpcStrategy(targetUrl) {
     hostname = new URL(targetUrl).hostname.replace(/^www\./, '').toLowerCase();
   } catch (_) {}
 
-  const isBpcDomain = bpcRules.domains.includes(hostname);
-  const isArchiveForced = bpcRules.archiveDomains.includes(hostname);
-  const siteRule = bpcRules.sitesMap[hostname] || null;
+  const isBpcDomain = matchesDomainSet(hostname, bpcRules.domains);
+  const isArchiveForced = matchesDomainSet(hostname, bpcRules.archiveDomains);
+  const siteRule = findSiteRule(hostname, bpcRules.sitesMap);
+  const forceStripImages = siteRule?.stripImages === true;
 
-  // 1. Build BPC Custom Headers
+  let userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+  let referer = '';
+
+  if (siteRule?.useragent) {
+    userAgent = siteRule.useragent;
+  } else if (isBpcDomain) {
+    userAgent = 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)';
+  }
+
+  if (siteRule?.referer) {
+    referer = siteRule.referer;
+  } else if (isBpcDomain) {
+    referer = 'https://www.google.com/';
+  }
+
   const bpcHeaders = {
-    'User-Agent': isBpcDomain 
-      ? 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)'
-      : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    'Referer': isBpcDomain ? 'https://www.google.com/' : 'https://www.google.com/',
+    'User-Agent': userAgent,
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     'Accept-Language': 'en-US,en;q=0.9'
   };
+  if (referer) bpcHeaders['Referer'] = referer;
 
-  // 2. Build Site Execution Priority Sequence
-  let pipelineSequence;
-  if (isArchiveForced) {
-    // Forced archive routing by BPC rules
-    pipelineSequence = [fetchViaArchivePh, fetchViaLiveMiddleware, fetchViaWayback, fetchDirect];
-  } else {
-    // Default BPC Direct-first sequence
-    pipelineSequence = [fetchDirect, fetchViaLiveMiddleware, fetchViaArchivePh, fetchViaWayback];
+  if (siteRule?.customHeaders) {
+    Object.assign(bpcHeaders, siteRule.customHeaders);
   }
+
+  const pipelineSequence = isArchiveForced
+    ? [fetchViaArchivePh, fetchViaLiveMiddleware, fetchViaWayback, fetchDirect]
+    : [fetchDirect, fetchViaLiveMiddleware, fetchViaArchivePh, fetchViaWayback];
 
   return {
     hostname,
     isBpcDomain,
     isArchiveForced,
     siteRule,
+    forceStripImages,
     headers: bpcHeaders,
     pipelineSequence
   };
 }
 
 // ==========================================
-// LAYER 2: FETCH TIERS
+// FETCH TIERS
 // ==========================================
 
-// Tier A: BPC Direct Fetch + Readability (Uses Layer 1 BPC Headers)
 async function fetchDirect(targetUrl, bpcConfig, parentSignal, stripImages = false) {
   let dom = null;
   try {
+    // Cap custom Tier 1 timeout at 4000ms to preserve budget for downstream tiers
+    const requestedTimeout = bpcConfig.siteRule?.timeoutMs || 2500;
+    const timeoutMs = Math.min(requestedTimeout, 4000);
+
     const response = await fetch(targetUrl, {
       headers: bpcConfig.headers,
-      signal: getCombinedSignal(2500, parentSignal)
+      signal: getCombinedSignal(timeoutMs, parentSignal)
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const html = await response.text();
@@ -369,7 +417,7 @@ async function fetchDirect(targetUrl, bpcConfig, parentSignal, stripImages = fal
     const article = reader.parse();
 
     if (!article || !article.content || !isValidContent(article.content)) {
-      throw new Error('Tier Content invalid or incomplete');
+      throw new Error('Tier 1 content invalid or incomplete');
     }
     return buildKindleHTML(article.title, article.content, targetUrl, stripImages);
   } finally {
@@ -380,7 +428,6 @@ async function fetchDirect(targetUrl, bpcConfig, parentSignal, stripImages = fal
   }
 }
 
-// Tier B: Jina AI Middleware
 async function fetchViaLiveMiddleware(targetUrl, bpcConfig, parentSignal, stripImages = false) {
   const response = await fetch(`https://r.jina.ai/${targetUrl}`, {
     headers: getJinaHeaders(),
@@ -397,8 +444,8 @@ async function fetchViaLiveMiddleware(targetUrl, bpcConfig, parentSignal, stripI
   return buildKindleHTML(json.data.title || 'Article', htmlContent, targetUrl, stripImages);
 }
 
-// Tier C: archive.ph via Jina AI
 async function fetchViaArchivePh(targetUrl, bpcConfig, parentSignal, stripImages = false) {
+  // Reverted to /newest/ so Jina AI follows the 302 redirect to the snapshot page
   const archivePhUrl = `https://archive.ph/newest/${targetUrl}`;
   const response = await fetch(`https://r.jina.ai/${archivePhUrl}`, {
     headers: getJinaHeaders(),
@@ -415,7 +462,6 @@ async function fetchViaArchivePh(targetUrl, bpcConfig, parentSignal, stripImages
   return buildKindleHTML(json.data.title || 'Archived Article', htmlContent, targetUrl, stripImages);
 }
 
-// Tier D: Wayback Machine
 async function fetchViaWayback(targetUrl, bpcConfig, parentSignal, stripImages = false) {
   const apiRes = await fetch(`https://archive.org/wayback/available?url=${encodeURIComponent(targetUrl)}`, {
     signal: getCombinedSignal(4000, parentSignal)
@@ -433,8 +479,11 @@ async function fetchViaWayback(targetUrl, bpcConfig, parentSignal, stripImages =
 // PIPELINE EXECUTION
 // ==========================================
 
-async function executePipeline(targetUrl, signal, stripImages = false) {
-  const cacheKey = stripImages ? `${targetUrl}#no_img` : targetUrl;
+async function executePipeline(targetUrl, signal, stripImages = false, debug = false) {
+  const bpcConfig = resolveBpcStrategy(targetUrl);
+  const effectiveStripImages = stripImages || bpcConfig.forceStripImages;
+
+  const cacheKey = effectiveStripImages ? `${targetUrl}#no_img` : targetUrl;
   const cachedHtml = articleCache.get(cacheKey);
   if (cachedHtml) return cachedHtml;
 
@@ -442,17 +491,16 @@ async function executePipeline(targetUrl, signal, stripImages = false) {
     throw new Error('Recent extraction failure (cached error)');
   }
 
-  // 1. EXECUTE LAYER 1: BPC Rule Evaluation
-  const bpcConfig = resolveBpcStrategy(targetUrl);
-
-  // 2. EXECUTE LAYER 2: Run BPC-driven tier pipeline
   for (const tierFn of bpcConfig.pipelineSequence) {
     try {
       if (signal?.aborted) break;
-      const html = await tierFn(targetUrl, bpcConfig, signal, stripImages);
+      const html = await tierFn(targetUrl, bpcConfig, signal, effectiveStripImages);
       articleCache.set(cacheKey, html);
       return html;
-    } catch (_) {
+    } catch (err) {
+      if (debug) {
+        console.error(`[DEBUG] [${bpcConfig.hostname}] [${tierFn.name}] Failed: ${err.message}`);
+      }
       continue;
     }
   }
@@ -471,7 +519,7 @@ app.get('/', (req, res) => {
   res.json({
     service: 'quickrss-proxy',
     status: 'online',
-    layer1_bpc_rules_loaded: bpcRules.domains.length || 0
+    bpc_rules_loaded: bpcRules.domains.size || 0
   });
 });
 
@@ -485,14 +533,18 @@ app.get('/extract', async (req, res) => {
   if (!targetUrl) return res.status(400).send('Invalid URL provided.');
 
   const stripImages = req.query.no_images === 'true' || req.query.no_images === '1';
+  const debug = req.query.debug === 'true' || req.query.debug === '1';
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 18000);
 
   try {
-    const result = await executePipeline(targetUrl, controller.signal, stripImages);
+    const result = await executePipeline(targetUrl, controller.signal, stripImages, debug);
     return res.send(result);
   } catch (err) {
+    if (debug) {
+      console.error(`[EXTRACTION FAILED] Domain: ${targetUrl} | Reason: ${err.message}`);
+    }
     if (controller.signal.aborted) {
       return res.status(504).send('Extraction timed out.');
     }
@@ -502,120 +554,4 @@ app.get('/extract', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`QuickRSS Proxy listening on port ${PORT}`));const express = require('express');
-const cors = require('cors');
-const fs = require('fs');
-const path = require('path');
-const https = require('https');
-const http = require('http');
-
-const app = express();
-const PORT = process.env.PORT || 3000;
-
-app.use(cors());
-app.use(express.json());
-
-// Load or build BPC rules
-const rulesPath = path.join(__dirname, 'bpc-rules.json');
-let bpcRules = { sitesMap: {}, domains: [], archiveDomains: [] };
-
-function loadRules() {
-  if (fs.existsSync(rulesPath)) {
-    bpcRules = JSON.parse(fs.readFileSync(rulesPath, 'utf-8'));
-    console.log(`[SERVER] Loaded BPC Rules with ${bpcRules.totalDomains || 0} active domains.`);
-  } else {
-    console.warn('[SERVER] bpc-rules.json not found. Running build-bpc-rules.js...');
-    require('./build-bpc-rules.js');
-    if (fs.existsSync(rulesPath)) {
-      bpcRules = JSON.parse(fs.readFileSync(rulesPath, 'utf-8'));
-    }
-  }
-}
-
-loadRules();
-
-// Helper: Check if domain is listed
-function matchDomain(targetUrl) {
-  try {
-    const hostname = new URL(targetUrl).hostname.replace(/^www\./, '');
-    const isArchive = bpcRules.archiveDomains.includes(hostname);
-    const isSupported = bpcRules.domains.includes(hostname);
-    return { hostname, isSupported, isArchive };
-  } catch (e) {
-    return { hostname: '', isSupported: false, isArchive: false };
-  }
-}
-
-// QuickRSS Proxy Endpoint
-app.get('/proxy', (req, res) => {
-  const targetUrl = req.query.url;
-
-  if (!targetUrl) {
-    return res.status(400).json({ error: 'Missing url parameter' });
-  }
-
-  const { hostname, isSupported, isArchive } = matchDomain(targetUrl);
-
-  let fetchUrl = targetUrl;
-  if (isArchive) {
-    fetchUrl = `https://archive.is/newest/${encodeURIComponent(targetUrl)}`;
-  }
-
-  // Header Spoofing for Bypass
-  const headers = {
-    'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
-    'Referer': 'https://www.google.com/',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.9'
-  };
-
-  const client = fetchUrl.startsWith('https') ? https : http;
-
-  const proxyReq = client.get(fetchUrl, { headers }, (upstreamRes) => {
-    // Pass through status and content-type
-    res.status(upstreamRes.statusCode);
-    res.setHeader('Content-Type', upstreamRes.headers['content-type'] || 'text/html');
-    res.setHeader('X-QuickRSS-Matched-Domain', hostname);
-    res.setHeader('X-QuickRSS-Bypass-Status', isSupported ? 'active' : 'passthrough');
-
-    upstreamRes.pipe(res);
-  });
-
-  proxyReq.on('error', (err) => {
-    res.status(500).json({ error: 'Proxy request failed', message: err.message });
-  });
-});
-
-// API Routes
-app.get('/api/domains', (req, res) => {
-  res.json({
-    total: bpcRules.domains.length,
-    domains: bpcRules.domains
-  });
-});
-
-app.get('/api/sites', (req, res) => {
-  res.json(bpcRules.sitesMap);
-});
-
-app.get('/api/check', (req, res) => {
-  const targetDomain = (req.query.domain || '').toLowerCase().replace(/^www\./, '');
-  const isSupported = bpcRules.domains.includes(targetDomain);
-  res.json({
-    domain: targetDomain,
-    supported: isSupported,
-    requiresArchive: bpcRules.archiveDomains.includes(targetDomain)
-  });
-});
-
-app.get('/', (req, res) => {
-  res.json({
-    name: 'quickrss-proxy',
-    status: 'running',
-    rulesLoaded: bpcRules.totalDomains || 0
-  });
-});
-
-app.listen(PORT, () => {
-  console.log(`QuickRSS Proxy listening on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`QuickRSS Proxy listening on port ${PORT}`));
