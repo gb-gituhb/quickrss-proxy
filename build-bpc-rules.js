@@ -12,11 +12,14 @@ if (!fs.existsSync(sitesJsPath)) {
 }
 
 try {
-  const code = fs.readFileSync(sitesJsPath, 'utf-8');
+  let code = fs.readFileSync(sitesJsPath, 'utf-8');
 
-  // Expanded browser environment stubs to prevent runtime errors in complex BPC forks
+  // Strip CommonJS/ESM export wrappers if present
+  code = code.replace(/export\s+default\s+/, 'var defaultSites = ');
+  code = code.replace(/module\.exports\s*=\s*/, 'var defaultSites = ');
+
+  // Construct sandbox with circular window/self references
   const sandbox = {
-    window: {},
     document: {},
     location: { href: '', hostname: '' },
     navigator: { userAgent: 'Mozilla/5.0' },
@@ -28,12 +31,15 @@ try {
     fetch: () => Promise.resolve({}),
     XMLHttpRequest: class FakeXHR {},
     addEventListener: () => {},
-    removeEventListener: () => {}
+    removeEventListener: () => {},
+    get window() { return this; },
+    get self() { return this; },
+    get globalThis() { return this; }
   };
 
   const context = vm.createContext(sandbox);
 
-  // Wrap code block to capture top-level let/const bindings in local lexical scope
+  // Wrap code block to capture top-level let/const/var bindings in local lexical scope
   const wrappedCode = `
     ${code};
     ({
