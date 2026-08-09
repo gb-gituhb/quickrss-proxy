@@ -85,7 +85,6 @@ function sanitizeUrl(rawUrl) {
     return null;
 }
 
-// Detects raw HTML that is just a Client-Side Rendering (SPA) app shell or noscript block
 function isJsAppShell(rawHtml) {
     if (!rawHtml) return true;
     const stripped = rawHtml
@@ -100,7 +99,7 @@ function isJsAppShell(rawHtml) {
     return textOnly.length < 150;
 }
 
-// Cleans inline styles (prevents scaling issues) and updates image links
+// Cleans inline styles, strips active tags/embeds, and updates image sources
 function sanitizeContent(htmlContent, targetUrl) {
     if (!htmlContent) return '';
     let dom = null;
@@ -108,7 +107,11 @@ function sanitizeContent(htmlContent, targetUrl) {
         dom = parseHTML(`<div>${htmlContent}</div>`);
         const doc = dom.window.document;
 
-        // Remove inline styles that break E-ink layout/fonts
+        // Strip scripts, inline styles, embeds, and forms
+        const badTags = doc.querySelectorAll('script, style, iframe, object, embed, form, noscript');
+        badTags.forEach(el => el.remove());
+
+        // Remove inline style attributes that break E-ink layout/fonts
         const styledElements = doc.querySelectorAll('[style]');
         styledElements.forEach(el => el.removeAttribute('style'));
 
@@ -229,7 +232,7 @@ function isValidContent(htmlContent) {
         return false;
     }
 
-    // 2. Truncation & Paywall Teaser Detection (< 800 words with trigger phrases)
+    // 2. Truncation & Paywall Teaser Detection (< 450 words with trigger phrases)
     const wordCount = plainText.split(/\s+/).filter(Boolean).length;
     const truncationMarkers = [
         'continue reading', 'read full story', 'read full article', 
@@ -238,16 +241,16 @@ function isValidContent(htmlContent) {
         'sign in to continue', 'register to read'
     ];
 
-    if (truncationMarkers.some(keyword => lower.includes(keyword)) && wordCount < 800) {
+    if (truncationMarkers.some(keyword => lower.includes(keyword)) && wordCount < 450) {
         return false;
     }
 
-    // 3. Absolute Minimum Word Threshold (300 words)
+    // 3. Absolute Minimum Word Threshold (200 words)
     const paragraphCount = (scanWindow.match(/<p[\s>]/gi) || []).length;
-    return !(wordCount < 300 || paragraphCount < 2);
+    return !(wordCount < 200 || paragraphCount < 2);
 }
 
-// Tier 1: Direct Fetch
+// Tier 1: Direct Fetch (2.5s)
 async function fetchDirect(targetUrl, parentSignal) {
     let dom = null;
     try {
@@ -262,7 +265,6 @@ async function fetchDirect(targetUrl, parentSignal) {
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const html = await response.text();
 
-        // Immediately throw if the raw payload is an unrendered JS app shell
         if (isJsAppShell(html)) {
             throw new Error('Raw HTML is an unrendered JS application shell');
         }
@@ -292,11 +294,11 @@ async function fetchDirect(targetUrl, parentSignal) {
     }
 }
 
-// Tier 2: Jina AI Middleware
+// Tier 2: Jina AI Middleware (5.0s)
 async function fetchViaLiveMiddleware(targetUrl, parentSignal) {
     const response = await fetch(`https://r.jina.ai/${targetUrl}`, {
         headers: getJinaHeaders(),
-        signal: getCombinedSignal(6500, parentSignal)
+        signal: getCombinedSignal(5000, parentSignal)
     });
     if (!response.ok) throw new Error(`Jina Live HTTP ${response.status}`);
     
@@ -309,12 +311,12 @@ async function fetchViaLiveMiddleware(targetUrl, parentSignal) {
     return buildKindleHTML(json.data.title || 'Article', htmlContent, targetUrl);
 }
 
-// Tier 3: archive.ph
+// Tier 3: archive.ph (5.5s)
 async function fetchViaArchivePh(targetUrl, parentSignal) {
     const archivePhUrl = `https://archive.ph/newest/${targetUrl}`;
     const response = await fetch(`https://r.jina.ai/${archivePhUrl}`, {
         headers: getJinaHeaders(),
-        signal: getCombinedSignal(7000, parentSignal)
+        signal: getCombinedSignal(5500, parentSignal)
     });
     if (!response.ok) throw new Error(`archive.ph HTTP ${response.status}`);
 
@@ -327,7 +329,7 @@ async function fetchViaArchivePh(targetUrl, parentSignal) {
     return buildKindleHTML(json.data.title || 'Archived Article', htmlContent, targetUrl);
 }
 
-// Tier 4: Wayback Machine
+// Tier 4: Wayback Machine (4.0s)
 async function fetchViaWayback(targetUrl, parentSignal) {
     const apiRes = await fetch(`https://archive.org/wayback/available?url=${encodeURIComponent(targetUrl)}`, {
         signal: getCombinedSignal(4000, parentSignal)
@@ -341,7 +343,7 @@ async function fetchViaWayback(targetUrl, parentSignal) {
     return await fetchDirect(snapshotUrl, parentSignal);
 }
 
-// Pipeline Execution (Universal Order)
+// Pipeline Execution
 async function executePipeline(targetUrl, signal) {
     const cachedHtml = articleCache.get(targetUrl);
     if (cachedHtml) return cachedHtml;
@@ -379,7 +381,7 @@ app.get('/extract', async (req, res) => {
     if (!targetUrl) return res.status(400).send('Invalid URL provided.');
 
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 16000);
+    const timeout = setTimeout(() => controller.abort(), 18000); // 18s global ceiling
 
     try {
         const result = await executePipeline(targetUrl, controller.signal);
