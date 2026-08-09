@@ -85,8 +85,8 @@ async function fetchViaMiddleware(targetUrl) {
 
     if (!json.data || !json.data.content) throw new Error('Middleware payload empty');
 
-    // Convert markdown content to clean HTML
-    const htmlContent = marked.parse(json.data.content);
+    // Convert markdown content to clean HTML safely
+    const htmlContent = await marked.parse(json.data.content);
     return buildKindleHTML(json.data.title || 'Article', htmlContent);
 }
 
