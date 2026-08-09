@@ -1,3 +1,4 @@
+// sites.js
 var defaultSites = {
   "60 Millions de consommateurs": "60millions-mag.com",
   "Aachener Zeitung (fetch from archive.is)": "aachener-zeitung.de",
