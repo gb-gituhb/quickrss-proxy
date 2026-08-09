@@ -63,14 +63,13 @@ function getJinaHeaders() {
 }
 
 function isValidContent(text) {
-    // Lowered threshold to 150 characters to support short video posts and brief news items
     if (!text || text.length < 150) return false;
     const lower = text.toLowerCase();
     const errorKeywords = ['captcha', 'enable javascript', 'access denied', 'subscribe to read', 'no snapshot', 'security check'];
     return !errorKeywords.some(keyword => lower.includes(keyword));
 }
 
-// Tier 1: Direct Fetch (6s Timeout)
+// Tier 1: Direct Fetch (4s Timeout)
 async function fetchDirect(targetUrl) {
     const response = await fetch(targetUrl, {
         headers: {
@@ -79,7 +78,7 @@ async function fetchDirect(targetUrl) {
             'Accept-Language': 'en-US,en;q=0.5',
             'Referer': 'https://www.google.com/'
         },
-        signal: AbortSignal.timeout(6000)
+        signal: AbortSignal.timeout(4000)
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const html = await response.text();
@@ -109,11 +108,11 @@ async function fetchDirect(targetUrl) {
     return buildKindleHTML(article.title, article.content);
 }
 
-// Tier 2: Live Anti-Bot Middleware (18s Timeout)
+// Tier 2: Live Anti-Bot Middleware (10s Timeout)
 async function fetchViaLiveMiddleware(targetUrl) {
     const response = await fetch(`https://r.jina.ai/${targetUrl}`, {
         headers: getJinaHeaders(),
-        signal: AbortSignal.timeout(18000)
+        signal: AbortSignal.timeout(10000)
     });
     if (!response.ok) throw new Error(`Jina Live HTTP ${response.status}`);
     
@@ -126,12 +125,12 @@ async function fetchViaLiveMiddleware(targetUrl) {
     return buildKindleHTML(json.data.title || 'Article', htmlContent);
 }
 
-// Tier 3: archive.ph via Middleware (20s Timeout)
+// Tier 3: archive.ph via Middleware (12s Timeout)
 async function fetchViaArchivePh(targetUrl) {
     const archivePhUrl = `https://archive.ph/newest/${targetUrl}`;
     const response = await fetch(`https://r.jina.ai/${archivePhUrl}`, {
         headers: getJinaHeaders(),
-        signal: AbortSignal.timeout(20000)
+        signal: AbortSignal.timeout(12000)
     });
     if (!response.ok) throw new Error(`archive.ph HTTP ${response.status}`);
 
@@ -144,10 +143,10 @@ async function fetchViaArchivePh(targetUrl) {
     return buildKindleHTML(json.data.title || 'Archived Article', htmlContent);
 }
 
-// Tier 4: Wayback Machine Fallback (8s Timeout)
+// Tier 4: Wayback Machine Fallback (5s Timeout)
 async function fetchViaWayback(targetUrl) {
     const apiRes = await fetch(`https://archive.org/wayback/available?url=${encodeURIComponent(targetUrl)}`, {
-        signal: AbortSignal.timeout(8000)
+        signal: AbortSignal.timeout(5000)
     });
     
     if (!apiRes.ok) throw new Error(`Wayback API HTTP ${apiRes.status}`);
