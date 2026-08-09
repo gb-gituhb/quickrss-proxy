@@ -15,11 +15,9 @@ if (!fs.existsSync(sitesJsPath)) {
 try {
   let code = fs.readFileSync(sitesJsPath, 'utf-8');
 
-  // Strip CommonJS/ESM export wrappers
   code = code.replace(/export\s+default\s+/, 'var defaultSites = ');
   code = code.replace(/module\.exports\s*=\s*/, 'var defaultSites = ');
 
-  // Browser environment stubs with circular global references
   const sandbox = {
     document: {},
     location: { href: '', hostname: '' },
