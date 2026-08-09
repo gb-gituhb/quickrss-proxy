@@ -28,28 +28,27 @@ if (fs.existsSync(rulesPath)) {
   }
 }
 
-// O(k) Subdomain-depth lookup against Set
+// Subdomain-depth lookup against Set
 function matchesDomainSet(hostname, domainSet) {
   if (!hostname || !(domainSet instanceof Set)) return false;
   if (domainSet.has(hostname)) return true;
   
   const parts = hostname.split('.');
-  while (parts.length > 1) {
-    parts.shift();
-    if (domainSet.has(parts.join('.'))) return true;
+  for (let i = 1; i < parts.length; i++) {
+    const parentDomain = parts.slice(i).join('.');
+    if (domainSet.has(parentDomain)) return true;
   }
   return false;
 }
 
-// O(k) Subdomain-depth lookup for site configuration rules
+// Subdomain-depth lookup for site configuration rules (Non-mutating)
 function findSiteRule(hostname, sitesMap = {}) {
   if (!hostname || !sitesMap) return null;
   if (sitesMap[hostname]) return sitesMap[hostname];
 
   const parts = hostname.split('.');
-  while (parts.length > 1) {
-    parts.shift();
-    const parentDomain = parts.join('.');
+  for (let i = 1; i < parts.length; i++) {
+    const parentDomain = parts.slice(i).join('.');
     if (sitesMap[parentDomain]) return sitesMap[parentDomain];
   }
   return null;
@@ -164,8 +163,18 @@ function sanitizeContent(htmlContent, targetUrl, stripAllImages = false) {
     const badTags = doc.querySelectorAll('script, style, iframe, object, embed, form, noscript, svg, canvas, source');
     badTags.forEach(el => el.remove());
 
-    const styledElements = doc.querySelectorAll('[style]');
-    styledElements.forEach(el => el.removeAttribute('style'));
+    // Security Hardening: Strip inline styling and on* event attributes
+    const allElements = doc.querySelectorAll('*');
+    allElements.forEach(el => {
+      el.removeAttribute('style');
+      if (el.attributes) {
+        Array.from(el.attributes).forEach(attr => {
+          if (attr.name.startsWith('on')) {
+            el.removeAttribute(attr.name);
+          }
+        });
+      }
+    });
 
     const imgs = doc.querySelectorAll('img');
 
@@ -388,7 +397,6 @@ function resolveBpcStrategy(targetUrl) {
 async function fetchDirect(targetUrl, bpcConfig, parentSignal, stripImages = false) {
   let dom = null;
   try {
-    // Cap custom Tier 1 timeout at 4000ms to preserve budget for downstream tiers
     const requestedTimeout = bpcConfig.siteRule?.timeoutMs || 2500;
     const timeoutMs = Math.min(requestedTimeout, 4000);
 
@@ -445,8 +453,8 @@ async function fetchViaLiveMiddleware(targetUrl, bpcConfig, parentSignal, stripI
 }
 
 async function fetchViaArchivePh(targetUrl, bpcConfig, parentSignal, stripImages = false) {
-  // Reverted to /newest/ so Jina AI follows the 302 redirect to the snapshot page
-  const archivePhUrl = `https://archive.ph/newest/${targetUrl}`;
+  // Properly URL-encoded to prevent query parameter leaks to archive.ph
+  const archivePhUrl = `https://archive.ph/newest/${encodeURIComponent(targetUrl)}`;
   const response = await fetch(`https://r.jina.ai/${archivePhUrl}`, {
     headers: getJinaHeaders(),
     signal: getCombinedSignal(5500, parentSignal)
@@ -505,7 +513,11 @@ async function executePipeline(targetUrl, signal, stripImages = false, debug = f
     }
   }
 
-  errorCache.set(cacheKey, true);
+  // Only cache as temporary error if not aborted by global timeout
+  if (!signal?.aborted) {
+    errorCache.set(cacheKey, true);
+  }
+
   throw new Error('Failed to extract article content across all pipelines.');
 }
 
