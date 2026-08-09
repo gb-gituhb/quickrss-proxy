@@ -93,7 +93,7 @@ app.get('/extract', async (req, res) => {
     return res.setHeader('Content-Type', 'text/html').send(html);
   }
 
-  console.log('Stage 2 failed. Attempting Stage 3 (Morss)...');
+  console.log('Stage 3: Fallback Morss...');
   html = await extractMorss(targetUrl);
   if (html) {
     console.log('Stage 3 (Morss) succeeded');
@@ -106,3 +106,5 @@ app.get('/extract', async (req, res) => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`BPC Cloud Proxy listening on port ${PORT}`);
 });
+
+
