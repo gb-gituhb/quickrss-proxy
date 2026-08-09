@@ -372,9 +372,12 @@ function resolveBpcStrategy(targetUrl) {
     Object.assign(bpcHeaders, siteRule.customHeaders);
   }
 
+  // CRITICAL FIX: Only use archive services for explicitly flagged domains.
+  // Normal sites use Direct -> Jina -> Wayback. This prevents archive.ph IP blocking
+  // from excessive requests on every failed extraction across the internet.
   const pipelineSequence = isArchiveForced
-    ? [fetchViaArchivePh, fetchViaArchiveToday, fetchViaLiveMiddleware, fetchViaWayback, fetchDirect]
-    : [fetchDirect, fetchViaLiveMiddleware, fetchViaArchivePh, fetchViaArchiveToday, fetchViaWayback];
+    ? [fetchViaLiveMiddleware, fetchViaArchivePh, fetchViaArchiveToday, fetchViaGhostArchive, fetchViaWayback, fetchDirect]
+    : [fetchDirect, fetchViaLiveMiddleware, fetchViaWayback];
 
   return {
     hostname,
@@ -450,7 +453,9 @@ async function fetchViaLiveMiddleware(targetUrl, bpcConfig, parentSignal, stripI
 }
 
 async function fetchViaArchivePh(targetUrl, bpcConfig, parentSignal, stripImages = false) {
-  // Properly URL-encoded to prevent query parameter leaks to archive.ph
+  // Small delay to avoid hammering archive.ph and triggering rate limits
+  await new Promise(r => setTimeout(r, 500));
+
   const archivePhUrl = `https://archive.ph/newest/${encodeURIComponent(targetUrl)}`;
   const response = await fetch(`https://r.jina.ai/${archivePhUrl}`, {
     headers: getJinaHeaders(),
@@ -468,6 +473,8 @@ async function fetchViaArchivePh(targetUrl, bpcConfig, parentSignal, stripImages
 }
 
 async function fetchViaArchiveToday(targetUrl, bpcConfig, parentSignal, stripImages = false) {
+  await new Promise(r => setTimeout(r, 500));
+
   const archiveTodayUrl = `https://archive.today/newest/${encodeURIComponent(targetUrl)}`;
   const response = await fetch(`https://r.jina.ai/${archiveTodayUrl}`, {
     headers: getJinaHeaders(),
@@ -480,6 +487,23 @@ async function fetchViaArchiveToday(targetUrl, bpcConfig, parentSignal, stripIma
 
   const htmlContent = await marked.parse(json.data.content);
   if (!isValidContent(htmlContent)) throw new Error('archive.today snapshot missing or blocked');
+
+  return buildKindleHTML(json.data.title || 'Archived Article', htmlContent, targetUrl, stripImages);
+}
+
+async function fetchViaGhostArchive(targetUrl, bpcConfig, parentSignal, stripImages = false) {
+  const ghostUrl = `https://ghostarchive.org/archive/${encodeURIComponent(targetUrl)}`;
+  const response = await fetch(`https://r.jina.ai/${ghostUrl}`, {
+    headers: getJinaHeaders(),
+    signal: getCombinedSignal(12000, parentSignal)
+  });
+  if (!response.ok) throw new Error(`Ghost Archive HTTP ${response.status}`);
+
+  const json = await response.json();
+  if (!json.data || !json.data.content) throw new Error('Ghost Archive payload empty');
+
+  const htmlContent = await marked.parse(json.data.content);
+  if (!isValidContent(htmlContent)) throw new Error('Ghost Archive snapshot missing or blocked');
 
   return buildKindleHTML(json.data.title || 'Archived Article', htmlContent, targetUrl, stripImages);
 }
