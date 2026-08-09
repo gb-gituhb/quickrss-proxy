@@ -57,7 +57,10 @@ function buildKindleHTML(title, content) {
 }
 
 function getJinaHeaders() {
-    const headers = { 'Accept': 'application/json' };
+    const headers = { 
+        'Accept': 'application/json',
+        'X-No-Cache': 'true'
+    };
     if (JINA_API_KEY) headers['Authorization'] = `Bearer ${JINA_API_KEY}`;
     return headers;
 }
@@ -65,8 +68,21 @@ function getJinaHeaders() {
 function isValidContent(text) {
     if (!text || text.length < 150) return false;
     const lower = text.toLowerCase();
-    const errorKeywords = ['captcha', 'enable javascript', 'access denied', 'subscribe to read', 'no snapshot', 'security check'];
-    return !errorKeywords.some(keyword => lower.includes(keyword));
+    
+    // Hard errors: these ALWAYS mean the fetch failed completely
+    const hardErrors = ['captcha', 'enable javascript', 'access denied', 'security check', 'just a moment...', 'pardon our interruption'];
+    if (hardErrors.some(keyword => lower.includes(keyword))) {
+        return false;
+    }
+
+    // Soft paywall phrases: only reject if the extracted content is short (< 800 chars).
+    // Long articles (> 800 chars) often contain "subscribe to read" in footer/navigation links.
+    const softPaywall = ['subscribe to read', 'no snapshot', 'create an account to read'];
+    if (text.length < 800 && softPaywall.some(keyword => lower.includes(keyword))) {
+        return false;
+    }
+
+    return true;
 }
 
 // Tier 1: Direct Fetch (4s Timeout)
@@ -167,6 +183,11 @@ app.get('/extract', async (req, res) => {
 
     // Clean out QuickRSS prefixes like "?step=3," and safely process arrays/objects
     const targetUrl = sanitizeUrl(rawUrl);
+
+    // Reject invalid or non-HTTP URLs immediately before running pipeline
+    if (!targetUrl || (!targetUrl.startsWith('http://') && !targetUrl.startsWith('https://'))) {
+        return res.status(400).send('Invalid or malformed URL provided.');
+    }
 
     try {
         return res.send(await fetchDirect(targetUrl));
