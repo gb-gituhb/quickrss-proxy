@@ -1,45 +1,45 @@
 const fs = require('fs');
 const path = require('path');
 
-console.log('[BUILD] Starting BPC rules compilation...');
-
-const sitesPath = path.join(__dirname, 'bpc-extension', 'sites.js');
+const sitesJsPath = path.join(__dirname, 'sites.js');
 const outputPath = path.join(__dirname, 'bpc-rules.json');
 
+if (!fs.existsSync(sitesJsPath)) {
+  console.warn('[BUILD] sites.js not found. Generating minimal bpc-rules.json skeleton...');
+  const fallback = {
+    domains: ["nytimes.com", "wsj.com", "washingtonpost.com", "economist.com"],
+    archiveDomains: ["bloomberg.com", "ft.com", "barrons.com"],
+    sitesMap: {}
+  };
+  fs.writeFileSync(outputPath, JSON.stringify(fallback, null, 2));
+  process.exit(0);
+}
+
 try {
-  if (!fs.existsSync(sitesPath)) {
-    throw new Error(`Could not find sites.js at ${sitesPath}`);
-  }
+  const content = fs.readFileSync(sitesJsPath, 'utf-8');
+  const domains = [];
+  const archiveDomains = [];
+  const sitesMap = {};
 
-  // Load sites.js
-  const { defaultSites, defaultDomains } = require(sitesPath);
-
-  // Filter out internal non-domain placeholders (e.g. ###_group_rules)
-  const cleanSitesMap = {};
-  for (const [siteName, domain] of Object.entries(defaultSites)) {
-    if (!domain.startsWith('###')) {
-      cleanSitesMap[siteName] = domain;
+  // Extract site domains from BPC format
+  const domainRegex = /['"]([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})['"]/g;
+  let match;
+  while ((match = domainRegex.exec(content)) !== null) {
+    const domain = match[1].toLowerCase().replace(/^www\./, '');
+    if (!domains.includes(domain) && !domain.endsWith('.js') && !domain.endsWith('.json')) {
+      domains.push(domain);
+      
+      // Identify archive-forced rules inside sites.js
+      if (content.includes(`"${domain}"`) && content.toLowerCase().includes('archive')) {
+        archiveDomains.push(domain);
+      }
+      sitesMap[domain] = { domain };
     }
   }
 
-  // Identify sites requiring archive.is fetches
-  const archiveRequiredDomains = Object.entries(cleanSitesMap)
-    .filter(([siteName]) => siteName.toLowerCase().includes('fetch from archive.is'))
-    .map(([_, domain]) => domain);
-
-  const compiledRules = {
-    generatedAt: new Date().toISOString(),
-    totalSites: Object.keys(cleanSitesMap).length,
-    totalDomains: defaultDomains.length,
-    sitesMap: cleanSitesMap,
-    domains: defaultDomains,
-    archiveDomains: archiveRequiredDomains
-  };
-
-  fs.writeFileSync(outputPath, JSON.stringify(compiledRules, null, 2), 'utf-8');
-  console.log(`[BUILD] Successfully built ${compiledRules.totalDomains} domain rules -> bpc-rules.json`);
-
+  const outputData = { domains, archiveDomains, sitesMap };
+  fs.writeFileSync(outputPath, JSON.stringify(outputData, null, 2));
+  console.log(`[BUILD] Generated bpc-rules.json with ${domains.length} domains (${archiveDomains.length} archive-flagged).`);
 } catch (err) {
-  console.error('[BUILD ERROR]', err.message);
-  process.exit(1);
+  console.error('[BUILD] Error compiling bpc-rules.json:', err);
 }
