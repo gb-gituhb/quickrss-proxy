@@ -1,6 +1,5 @@
 // server.js
 const express = require('express');
-const { Readability } = require('@mozilla/readability');
 const { parseHTML } = require('linkedom');
 const { marked } = require('marked');
 const JSZip = require('jszip');
@@ -45,30 +44,6 @@ if (fs.existsSync(rulesPath)) {
 
 HARDCODED_ARCHIVE_DOMAINS.forEach(d => bpcRules.archiveDomains.add(d));
 
-function matchesDomainSet(hostname, domainSet) {
-  if (!hostname || !(domainSet instanceof Set)) return false;
-  if (domainSet.has(hostname)) return true;
-
-  const parts = hostname.split('.');
-  for (let i = 1; i < parts.length; i++) {
-    const parentDomain = parts.slice(i).join('.');
-    if (domainSet.has(parentDomain)) return true;
-  }
-  return false;
-}
-
-function findSiteRule(hostname, sitesMap = {}) {
-  if (!hostname || !sitesMap) return null;
-  if (sitesMap[hostname]) return sitesMap[hostname];
-
-  const parts = hostname.split('.');
-  for (let i = 1; i < parts.length; i++) {
-    const parentDomain = parts.slice(i).join('.');
-    if (sitesMap[parentDomain]) return sitesMap[parentDomain];
-  }
-  return null;
-}
-
 class SimpleLRUCache {
   constructor(limit = 200, ttlMs = 60 * 60 * 1000) {
     this.limit = limit;
@@ -100,6 +75,25 @@ class SimpleLRUCache {
 
 const articleCache = new SimpleLRUCache(200, 60 * 60 * 1000);
 const errorCache = new SimpleLRUCache(100, 5 * 60 * 1000);
+
+const PERSISTENT_ROUTES_FILE = path.join(__dirname, 'domain-routes-cache.json');
+let autoLearnedArchiveDomains = new Set();
+
+if (fs.existsSync(PERSISTENT_ROUTES_FILE)) {
+  try {
+    const saved = JSON.parse(fs.readFileSync(PERSISTENT_ROUTES_FILE, 'utf-8'));
+    autoLearnedArchiveDomains = new Set(saved);
+    console.log(`[AUTO-ROUTER] Loaded ${autoLearnedArchiveDomains.size} auto-learned archive domains.`);
+  } catch (_) {}
+}
+
+function persistLearnedDomain(hostname) {
+  if (!hostname) return;
+  autoLearnedArchiveDomains.add(hostname);
+  try {
+    fs.writeFileSync(PERSISTENT_ROUTES_FILE, JSON.stringify(Array.from(autoLearnedArchiveDomains), null, 2));
+  } catch (_) {}
+}
 
 app.use((req, res, next) => {
   if (req.path === '/health' || req.path === '/') return next();
@@ -433,6 +427,30 @@ function isValidContent(htmlContent) {
   return !(wordCount < 200 || paragraphCount < 2);
 }
 
+function matchesDomainSet(hostname, domainSet) {
+  if (!hostname || !(domainSet instanceof Set)) return false;
+  if (domainSet.has(hostname)) return true;
+
+  const parts = hostname.split('.');
+  for (let i = 1; i < parts.length; i++) {
+    const parentDomain = parts.slice(i).join('.');
+    if (domainSet.has(parentDomain)) return true;
+  }
+  return false;
+}
+
+function findSiteRule(hostname, sitesMap = {}) {
+  if (!hostname || !sitesMap) return null;
+  if (sitesMap[hostname]) return sitesMap[hostname];
+
+  const parts = hostname.split('.');
+  for (let i = 1; i < parts.length; i++) {
+    const parentDomain = parts.slice(i).join('.');
+    if (sitesMap[parentDomain]) return sitesMap[parentDomain];
+  }
+  return null;
+}
+
 function resolveBpcStrategy(targetUrl) {
   let hostname = '';
   try {
@@ -444,19 +462,12 @@ function resolveBpcStrategy(targetUrl) {
   const siteRule = findSiteRule(hostname, bpcRules.sitesMap);
   const forceStripImages = siteRule?.stripImages === true;
 
-  // Standard domains use Jina AI as Tier 1.
-  // Archive-forced domains bypass Jina AI and route straight to web archive mirrors.
-  const pipelineSequence = isArchiveForced
-    ? [fetchViaArchivePh, fetchViaArchiveToday, fetchViaGhostArchive, fetchViaWayback]
-    : [fetchViaLiveMiddleware, fetchViaArchivePh, fetchViaWayback];
-
   return {
     hostname,
     isBpcDomain,
     isArchiveForced,
     siteRule,
-    forceStripImages,
-    pipelineSequence
+    forceStripImages
   };
 }
 
@@ -482,8 +493,6 @@ async function fetchViaLiveMiddleware(targetUrl, bpcConfig, parentSignal, stripI
 }
 
 async function fetchViaArchivePh(targetUrl, bpcConfig, parentSignal, stripImages = false) {
-  await new Promise(r => setTimeout(r, 500));
-
   const archivePhUrl = `https://archive.ph/newest/${encodeURIComponent(targetUrl)}`;
   const response = await fetch(`https://r.jina.ai/${archivePhUrl}`, {
     headers: getJinaHeaders(),
@@ -501,8 +510,6 @@ async function fetchViaArchivePh(targetUrl, bpcConfig, parentSignal, stripImages
 }
 
 async function fetchViaArchiveToday(targetUrl, bpcConfig, parentSignal, stripImages = false) {
-  await new Promise(r => setTimeout(r, 500));
-
   const archiveTodayUrl = `https://archive.today/newest/${encodeURIComponent(targetUrl)}`;
   const response = await fetch(`https://r.jina.ai/${archiveTodayUrl}`, {
     headers: getJinaHeaders(),
@@ -561,11 +568,50 @@ async function fetchViaWayback(targetUrl, bpcConfig, parentSignal, stripImages =
   return { title: json.data.title || 'Archived Article', content: htmlContent, url: targetUrl };
 }
 
-async function executePipeline(targetUrl, signal, stripImages = false, debug = false) {
+async function raceFetchers(fetchers, targetUrl, bpcConfig, globalSignal, stripImages, staggerMs = 800) {
+  const raceController = new AbortController();
+  const combinedSignal = AbortSignal.any ? AbortSignal.any([globalSignal, raceController.signal]) : raceController.signal;
+
+  const promises = fetchers.map((fetcherFn, index) => {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(async () => {
+        if (combinedSignal.aborted) return reject(new Error('Aborted'));
+        try {
+          const res = await fetcherFn(targetUrl, bpcConfig, combinedSignal, stripImages);
+          if (res && res.content) {
+            resolve({ result: res, fetcherName: fetcherFn.name });
+          } else {
+            reject(new Error(`${fetcherFn.name} returned empty content`));
+          }
+        } catch (err) {
+          reject(err);
+        }
+      }, index * staggerMs);
+
+      globalSignal?.addEventListener('abort', () => clearTimeout(timer), { once: true });
+    });
+  });
+
+  try {
+    const winner = await Promise.any(promises);
+    raceController.abort();
+    return winner;
+  } catch (aggregateError) {
+    raceController.abort();
+    throw new Error('All speculatively raced tiers failed.');
+  }
+}
+
+async function executeOptimizedPipeline(targetUrl, globalSignal, stripImages = false, debug = false) {
+  let hostname = '';
+  try {
+    hostname = new URL(targetUrl).hostname.replace(/^www\./, '').toLowerCase();
+  } catch (_) {}
+
   const bpcConfig = resolveBpcStrategy(targetUrl);
   const effectiveStripImages = stripImages || bpcConfig.forceStripImages;
-
   const cacheKey = effectiveStripImages ? `${targetUrl}#no_img` : targetUrl;
+
   const cachedHtml = articleCache.get(cacheKey);
   if (cachedHtml) return cachedHtml;
 
@@ -573,25 +619,48 @@ async function executePipeline(targetUrl, signal, stripImages = false, debug = f
     throw new Error('Recent extraction failure (cached error)');
   }
 
-  for (const tierFn of bpcConfig.pipelineSequence) {
+  const isKnownArchive = bpcConfig.isArchiveForced || 
+                        matchesDomainSet(hostname, autoLearnedArchiveDomains);
+
+  if (isKnownArchive) {
+    const archiveFetchers = [fetchViaArchivePh, fetchViaArchiveToday, fetchViaGhostArchive, fetchViaWayback];
     try {
-      if (signal?.aborted) break;
-      const article = await tierFn(targetUrl, bpcConfig, signal, effectiveStripImages);
-      articleCache.set(cacheKey, article);
-      return article;
+      const { result } = await raceFetchers(archiveFetchers, targetUrl, bpcConfig, globalSignal, effectiveStripImages, 300);
+      articleCache.set(cacheKey, result);
+      return result;
     } catch (err) {
-      if (debug) {
-        console.error(`[DEBUG] [${bpcConfig.hostname}] [${tierFn.name}] Failed: ${err.message}`);
-      }
-      continue;
+      errorCache.set(cacheKey, true);
+      throw err;
     }
   }
 
-  if (!signal?.aborted) {
-    errorCache.set(cacheKey, true);
-  }
+  try {
+    const liveRaceCandidates = [fetchViaLiveMiddleware, fetchViaArchivePh];
+    const { result, fetcherName } = await raceFetchers(liveRaceCandidates, targetUrl, bpcConfig, globalSignal, effectiveStripImages, 800);
 
-  throw new Error('Failed to extract article content across all pipelines.');
+    if (fetcherName !== 'fetchViaLiveMiddleware' && hostname) {
+      persistLearnedDomain(hostname);
+      if (debug) console.log(`[AUTO-LEARN] Promoted ${hostname} to Archive-Forced domain routes.`);
+    }
+
+    articleCache.set(cacheKey, result);
+    return result;
+  } catch (primaryRaceErr) {
+    try {
+      const deepFallbackCandidates = [fetchViaArchiveToday, fetchViaGhostArchive, fetchViaWayback];
+      const { result } = await raceFetchers(deepFallbackCandidates, targetUrl, bpcConfig, globalSignal, effectiveStripImages, 300);
+
+      if (hostname) {
+        persistLearnedDomain(hostname);
+      }
+
+      articleCache.set(cacheKey, result);
+      return result;
+    } catch (finalErr) {
+      errorCache.set(cacheKey, true);
+      throw finalErr;
+    }
+  }
 }
 
 app.get('/health', (req, res) => res.status(200).send('OK'));
@@ -602,7 +671,7 @@ app.get('/', (req, res) => {
     status: 'online',
     tier1_provider: 'Jina AI',
     bpc_rules_loaded: bpcRules.domains.size || 0,
-    hardcoded_archive_domains: HARDCODED_ARCHIVE_DOMAINS.size
+    auto_learned_domains: autoLearnedArchiveDomains.size
   });
 });
 
@@ -621,7 +690,7 @@ app.get('/extract', async (req, res) => {
   const timeout = setTimeout(() => controller.abort(), 35000);
 
   try {
-    const article = await executePipeline(targetUrl, controller.signal, stripImages, debug);
+    const article = await executeOptimizedPipeline(targetUrl, controller.signal, stripImages, debug);
 
     if (format === 'epub') {
       const epubBuffer = await buildEpub(article.title, article.content, targetUrl, stripImages);
