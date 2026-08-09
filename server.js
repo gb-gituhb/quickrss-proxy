@@ -3,9 +3,10 @@ const { Readability } = require('@mozilla/readability');
 const { parseHTML } = require('linkedom');
 const fs = require('fs');
 const path = require('path');
+const { execSync } = require('child_process');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 
 // User-Agent Registry
 const UA_GOOGLEBOT = 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)';
@@ -13,15 +14,22 @@ const UA_BINGBOT = 'Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/b
 const UA_TWITTER = 'Twitterbot/1.0';
 const UA_DESKTOP = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
-// 1. Load Compiled BPC Rules
+// 1. Auto-Generate BPC Rules if Missing at Launch
+const rulesPath = path.join(__dirname, 'bpc_sites.json');
+if (!fs.existsSync(rulesPath)) {
+    console.log('bpc_sites.json not found. Running build-bpc-rules.js automatically...');
+    try {
+        execSync('node build-bpc-rules.js', { stdio: 'inherit' });
+    } catch (err) {
+        console.error('Failed to auto-generate bpc_sites.json:', err.message);
+    }
+}
+
 let BPC_RULES = {};
 try {
-    const rulesPath = path.join(__dirname, 'bpc_sites.json');
     if (fs.existsSync(rulesPath)) {
         BPC_RULES = JSON.parse(fs.readFileSync(rulesPath, 'utf8'));
         console.log(`Loaded ${Object.keys(BPC_RULES).length} rules from bpc_sites.json`);
-    } else {
-        console.warn('bpc_sites.json not found. Run "node build-bpc-rules.js" first.');
     }
 } catch (err) {
     console.error('Error reading bpc_sites.json:', err.message);
@@ -123,7 +131,6 @@ function sanitizeContent(htmlContent, targetUrl, stripAllImages = false) {
             'div[class*="cookie"]', 'div[class*="consent"]', 'div[id*="onetrust"]', 'tp-modal'
         ];
         doc.querySelectorAll(badSelectors.join(', ')).forEach(el => el.remove());
-
         doc.querySelectorAll('[style]').forEach(el => el.removeAttribute('style'));
 
         const imgs = doc.querySelectorAll('img');
@@ -147,11 +154,13 @@ function sanitizeContent(htmlContent, targetUrl, stripAllImages = false) {
 
                 try {
                     const absUrl = new URL(realSrc, targetUrl).href;
-                    if (!absUrl.startsWith('http://') || !absUrl.startsWith('https://')) {
+                    if (absUrl.startsWith('http://') || absUrl.startsWith('https://')) {
                         img.removeAttribute('srcset');
                         img.setAttribute('src', absUrl);
                         img.setAttribute('loading', 'lazy');
                         imageCount++;
+                    } else {
+                        img.remove();
                     }
                 } catch (_) {
                     img.remove();
@@ -193,7 +202,7 @@ function buildKindleHTML(title, content, targetUrl = '', stripAllImages = false)
 </html>`;
 }
 
-// Universal JSON-LD Unpacker for Client-Side Paywalls
+// JSON-LD Schema Extractor
 function extractJsonLd(doc) {
     try {
         const scripts = doc.querySelectorAll('script[type="application/ld+json"]');
@@ -231,7 +240,7 @@ async function fetchArchivePh(targetUrl, stripImages) {
     return buildKindleHTML('Archived Article', text, targetUrl, stripImages);
 }
 
-// Main Extraction Pipeline
+// Main Pipeline Exec
 async function executeBpcPipeline(targetUrl, stripImages) {
     const rule = getBpcRule(targetUrl);
 
@@ -272,7 +281,7 @@ async function executeBpcPipeline(targetUrl, stripImages) {
         const dom = parseHTML(html);
         const doc = dom.window.document;
 
-        // Auto-Discover AMP alternative link
+        // Auto-Discover AMP Link
         const ampNode = doc.querySelector('link[rel="amphtml"]');
         if (ampNode && ampNode.getAttribute('href')) {
             try {
@@ -290,21 +299,21 @@ async function executeBpcPipeline(targetUrl, stripImages) {
             } catch (_) {}
         }
 
-        // Strategy A: Direct Readability Parse
+        // Strategy A: Readability
         const reader = new Readability(doc);
         const article = reader.parse();
         if (article && isValidContent(article.content)) {
             return buildKindleHTML(article.title, article.content, targetUrl, stripImages);
         }
 
-        // Strategy B: Embedded JSON-LD Extract
+        // Strategy B: JSON-LD Unpacker
         const jsonLd = extractJsonLd(doc);
         if (jsonLd && isValidContent(jsonLd.content)) {
             return buildKindleHTML(jsonLd.title, jsonLd.content, targetUrl, stripImages);
         }
     }
 
-    // Remote JS Execution Fallback (Jina AI)
+    // Remote JS Engine Fallback (Jina AI)
     try {
         const jinaRes = await fetch(`https://r.jina.ai/${targetUrl}`, {
             headers: { 'X-No-Cache': 'true', 'X-Return-Format': 'html' },
