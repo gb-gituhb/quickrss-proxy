@@ -18,8 +18,31 @@ function sanitizeUrl(rawUrl) {
     return match ? match[1] : urlString;
 }
 
+// Clean image tags: make relative URLs absolute & strip tracking pixels to prevent Kindle image caching hangs
+function sanitizeImages(htmlContent, targetUrl) {
+    if (!htmlContent) return '';
+    
+    try {
+        const baseUrl = new URL(targetUrl).origin;
+        
+        // Replace relative img src links (/path/to/img.jpg) with absolute URLs
+        let cleaned = htmlContent.replace(/<img\s+[^>]*src=["'](\/[^"']+)["'][^>]*>/gi, (match, src) => {
+            return match.replace(src, `${baseUrl}${src}`);
+        });
+
+        // Remove 1x1 tracking pixels that cause Kindle timeouts
+        cleaned = cleaned.replace(/<img\s+[^>]*width=["']1["']\s+height=["']1["'][^>]*>/gi, '');
+        cleaned = cleaned.replace(/<img\s+[^>]*height=["']1["']\s+width=["']1["'][^>]*>/gi, '');
+
+        return cleaned;
+    } catch (e) {
+        return htmlContent;
+    }
+}
+
 // Wrap content in Kindle Paperwhite Charis SIL typography
-function buildKindleHTML(title, content) {
+function buildKindleHTML(title, content, targetUrl = '') {
+    const cleanedContent = targetUrl ? sanitizeImages(content, targetUrl) : content;
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -51,7 +74,7 @@ function buildKindleHTML(title, content) {
 <body>
     <h1>${title || 'Untitled'}</h1>
     <hr>
-    ${content}
+    ${cleanedContent}
 </body>
 </html>`;
 }
@@ -121,7 +144,7 @@ async function fetchDirect(targetUrl) {
     if (!article || !isValidContent(article.content)) {
         throw new Error('Direct fetch content invalid or paywalled');
     }
-    return buildKindleHTML(article.title, article.content);
+    return buildKindleHTML(article.title, article.content, targetUrl);
 }
 
 // Tier 2: Live Anti-Bot Middleware (10s Timeout)
@@ -138,7 +161,7 @@ async function fetchViaLiveMiddleware(targetUrl) {
     const htmlContent = await marked.parse(json.data.content);
     if (!isValidContent(htmlContent)) throw new Error('Jina Live content invalid or paywalled');
 
-    return buildKindleHTML(json.data.title || 'Article', htmlContent);
+    return buildKindleHTML(json.data.title || 'Article', htmlContent, targetUrl);
 }
 
 // Tier 3: archive.ph via Middleware (12s Timeout)
@@ -156,7 +179,7 @@ async function fetchViaArchivePh(targetUrl) {
     const htmlContent = await marked.parse(json.data.content);
     if (!isValidContent(htmlContent)) throw new Error('archive.ph snapshot not found or blocked');
 
-    return buildKindleHTML(json.data.title || 'Archived Article', htmlContent);
+    return buildKindleHTML(json.data.title || 'Archived Article', htmlContent, targetUrl);
 }
 
 // Tier 4: Wayback Machine Fallback (5s Timeout)
