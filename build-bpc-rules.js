@@ -1,7 +1,6 @@
 const fs = require('fs');
 const path = require('path');
 
-// Upstream raw BPC sites definition URL
 const BPC_RAW_URL = 'https://raw.githubusercontent.com/bpc-clone/bpc-rules/main/sites.js';
 
 async function buildBpcRules() {
@@ -13,7 +12,7 @@ async function buildBpcRules() {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         rawText = await res.text();
     } catch (err) {
-        console.warn('Failed to fetch remote BPC rules, generating offline fallback dataset...');
+        console.warn('Failed to fetch remote BPC rules, using fallback base dataset...');
         rawText = '';
     }
 
@@ -47,7 +46,7 @@ async function buildBpcRules() {
         }
     }
 
-    // Default high-value domain overrides and platform frameworks
+    // Default overrides for major paywalls
     const baseOverrides = {
         'nytimes.com': { strategy: 'googlebot' },
         'bloomberg.com': { strategy: 'googlebot' },
