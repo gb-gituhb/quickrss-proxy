@@ -2,6 +2,7 @@ const express = require('express');
 const { Readability } = require('@mozilla/readability');
 const { parseHTML } = require('linkedom');
 const { marked } = require('marked');
+const JSZip = require('jszip');
 const fs = require('fs');
 const path = require('path');
 
@@ -11,7 +12,6 @@ const JINA_API_KEY = process.env.JINA_API_KEY || '';
 const AUTH_TOKEN = process.env.AUTH_TOKEN || '';
 
 // Hardcoded fallback: domains that should always use archive-first routing
-// regardless of what the BPC build script produces
 const HARDCODED_ARCHIVE_DOMAINS = new Set([
   'economist.com',
   'ft.com',
@@ -264,6 +264,52 @@ function sanitizeContent(htmlContent, targetUrl, stripAllImages = false) {
   }
 }
 
+// ==========================================
+// OUTPUT FORMATTERS
+// ==========================================
+
+// QuickRSS-compatible HTML: structural CSS only, no font-size locks.
+// Uses 'em' units so spacing scales with QuickRSS's font size controls.
+function buildQuickRSSHTML(title, content, targetUrl = '', stripAllImages = false) {
+  const cleanedContent = targetUrl ? sanitizeContent(content, targetUrl, stripAllImages) : content;
+  const safeTitle = escapeHtml(title || 'Untitled');
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>${safeTitle}</title>
+    <style>
+        /* Structural styles only — QuickRSS controls font family and size */
+        body {
+            line-height: 1.6;
+            word-wrap: break-word;
+        }
+        h1 {
+            line-height: 1.3;
+            margin-bottom: 0.4em;
+        }
+        p {
+            margin-bottom: 1.2em;
+            text-align: justify;
+        }
+        img { max-width: 100%; height: auto; display: block; margin: 1em auto; }
+        a { color: inherit; text-decoration: underline; }
+        blockquote { border-left: 3px solid #000; padding-left: 12px; margin-left: 0; }
+        pre, code { font-family: monospace; white-space: pre-wrap; }
+        table { border-collapse: collapse; width: 100%; }
+        th, td { border: 1px solid #ccc; padding: 6px; }
+    </style>
+</head>
+<body>
+    <h1>${safeTitle}</h1>
+    <hr>
+    ${cleanedContent}
+</body>
+</html>`;
+}
+
+// Legacy Kindle HTML with embedded styling (for non-QuickRSS clients)
 function buildKindleHTML(title, content, targetUrl = '', stripAllImages = false) {
   const cleanedContent = targetUrl ? sanitizeContent(content, targetUrl, stripAllImages) : content;
   const safeTitle = escapeHtml(title || 'Untitled');
@@ -301,6 +347,85 @@ function buildKindleHTML(title, content, targetUrl = '', stripAllImages = false)
     ${cleanedContent}
 </body>
 </html>`;
+}
+
+async function buildEpub(title, content, targetUrl = '', stripAllImages = false) {
+  const cleanedContent = targetUrl ? sanitizeContent(content, targetUrl, stripAllImages) : content;
+  const safeTitle = escapeHtml(title || 'Untitled');
+  const id = 'id-' + Math.random().toString(36).slice(2);
+
+  const css = `/* EPUB Styles */
+body { font-family: 'Charis SIL', Georgia, serif; line-height: 1.6; }
+img { max-width: 100%; height: auto; display: block; margin: 15px auto; }
+a { color: #000; text-decoration: underline; }
+blockquote { border-left: 3px solid #000; padding-left: 12px; margin-left: 0; }
+pre, code { font-family: monospace; white-space: pre-wrap; }
+table { border-collapse: collapse; width: 100%; }
+th, td { border: 1px solid #ccc; padding: 6px; }`;
+
+  const chapterXhtml = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+    <title>${safeTitle}</title>
+    <link rel="stylesheet" type="text/css" href="style.css"/>
+</head>
+<body>
+    <h1>${safeTitle}</h1>
+    <hr/>
+    ${cleanedContent}
+</body>
+</html>`;
+
+  const containerXml = `<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+    <rootfiles>
+        <rootfile full-path="content.opf" media-type="application/oebps-package+xml"/>
+    </rootfiles>
+</container>`;
+
+  const contentOpf = `<?xml version="1.0" encoding="UTF-8"?>
+<package version="2.0" xmlns="http://www.idpf.org/2007/opf">
+    <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+        <dc:title>${safeTitle}</dc:title>
+        <dc:identifier id="bookid">${id}</dc:identifier>
+        <dc:language>en</dc:language>
+    </metadata>
+    <manifest>
+        <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>
+        <item id="style" href="style.css" media-type="text/css"/>
+        <item id="chapter" href="chapter.xhtml" media-type="application/xhtml+xml"/>
+    </manifest>
+    <spine toc="ncx">
+        <itemref idref="chapter"/>
+    </spine>
+</package>`;
+
+  const tocNcx = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE ncx PUBLIC "-//NISO//DTD ncx 2005-1//EN" "http://www.daisy.org/z3986/2005/ncx-2005-1.dtd">
+<ncx version="2005-1" xmlns="http://www.daisy.org/z3986/2005/ncx/">
+    <head>
+        <meta name="dtb:uid" content="${id}"/>
+        <meta name="dtb:depth" content="1"/>
+    </head>
+    <docTitle><text>${safeTitle}</text></docTitle>
+    <navMap>
+        <navPoint id="navpoint-1" playOrder="1">
+            <navLabel><text>${safeTitle}</text></navLabel>
+            <content src="chapter.xhtml"/>
+        </navPoint>
+    </navMap>
+</ncx>`;
+
+  const zip = new JSZip();
+  zip.file('mimetype', 'application/epub+zip', { compression: 'STORE' });
+  zip.folder('META-INF').file('container.xml', containerXml);
+  zip.file('content.opf', contentOpf);
+  zip.file('toc.ncx', tocNcx);
+  zip.file('style.css', css);
+  zip.file('chapter.xhtml', chapterXhtml);
+
+  return await zip.generateAsync({ type: 'nodebuffer' });
 }
 
 function getJinaHeaders() {
@@ -365,11 +490,9 @@ function resolveBpcStrategy(targetUrl) {
   const siteRule = findSiteRule(hostname, bpcRules.sitesMap);
   const forceStripImages = siteRule?.stripImages === true;
 
-  // Default universally to Googlebot UA & Google Referer for pre-rendered SEO markup on free news sites
   let userAgent = 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)';
   let referer = 'https://www.google.com/';
 
-  // Override if siteRule explicitly demands custom headers
   if (siteRule?.useragent) {
     userAgent = siteRule.useragent;
   }
@@ -388,9 +511,6 @@ function resolveBpcStrategy(targetUrl) {
     Object.assign(bpcHeaders, siteRule.customHeaders);
   }
 
-  // CRITICAL FIX: Only use archive services for explicitly flagged domains.
-  // Normal sites use Direct -> Jina -> Wayback. This prevents archive.ph IP blocking
-  // from excessive requests on every failed extraction across the internet.
   const pipelineSequence = isArchiveForced
     ? [fetchViaLiveMiddleware, fetchViaArchivePh, fetchViaArchiveToday, fetchViaGhostArchive, fetchViaWayback, fetchDirect]
     : [fetchDirect, fetchViaLiveMiddleware, fetchViaWayback];
@@ -443,7 +563,7 @@ async function fetchDirect(targetUrl, bpcConfig, parentSignal, stripImages = fal
     if (!article || !article.content || !isValidContent(article.content)) {
       throw new Error('Tier 1 content invalid or incomplete');
     }
-    return buildKindleHTML(article.title, article.content, targetUrl, stripImages);
+    return { title: article.title, content: article.content, url: targetUrl };
   } finally {
     if (dom && dom.window && typeof dom.window.close === 'function') {
       dom.window.close();
@@ -465,11 +585,10 @@ async function fetchViaLiveMiddleware(targetUrl, bpcConfig, parentSignal, stripI
   const htmlContent = await marked.parse(json.data.content);
   if (!isValidContent(htmlContent)) throw new Error('Jina Live content invalid or paywalled');
 
-  return buildKindleHTML(json.data.title || 'Article', htmlContent, targetUrl, stripImages);
+  return { title: json.data.title || 'Article', content: htmlContent, url: targetUrl };
 }
 
 async function fetchViaArchivePh(targetUrl, bpcConfig, parentSignal, stripImages = false) {
-  // Small delay to avoid hammering archive.ph and triggering rate limits
   await new Promise(r => setTimeout(r, 500));
 
   const archivePhUrl = `https://archive.ph/newest/${encodeURIComponent(targetUrl)}`;
@@ -485,7 +604,7 @@ async function fetchViaArchivePh(targetUrl, bpcConfig, parentSignal, stripImages
   const htmlContent = await marked.parse(json.data.content);
   if (!isValidContent(htmlContent)) throw new Error('archive.ph snapshot not found or blocked');
 
-  return buildKindleHTML(json.data.title || 'Archived Article', htmlContent, targetUrl, stripImages);
+  return { title: json.data.title || 'Archived Article', content: htmlContent, url: targetUrl };
 }
 
 async function fetchViaArchiveToday(targetUrl, bpcConfig, parentSignal, stripImages = false) {
@@ -504,7 +623,7 @@ async function fetchViaArchiveToday(targetUrl, bpcConfig, parentSignal, stripIma
   const htmlContent = await marked.parse(json.data.content);
   if (!isValidContent(htmlContent)) throw new Error('archive.today snapshot missing or blocked');
 
-  return buildKindleHTML(json.data.title || 'Archived Article', htmlContent, targetUrl, stripImages);
+  return { title: json.data.title || 'Archived Article', content: htmlContent, url: targetUrl };
 }
 
 async function fetchViaGhostArchive(targetUrl, bpcConfig, parentSignal, stripImages = false) {
@@ -521,7 +640,7 @@ async function fetchViaGhostArchive(targetUrl, bpcConfig, parentSignal, stripIma
   const htmlContent = await marked.parse(json.data.content);
   if (!isValidContent(htmlContent)) throw new Error('Ghost Archive snapshot missing or blocked');
 
-  return buildKindleHTML(json.data.title || 'Archived Article', htmlContent, targetUrl, stripImages);
+  return { title: json.data.title || 'Archived Article', content: htmlContent, url: targetUrl };
 }
 
 async function fetchViaWayback(targetUrl, bpcConfig, parentSignal, stripImages = false) {
@@ -556,9 +675,9 @@ async function executePipeline(targetUrl, signal, stripImages = false, debug = f
   for (const tierFn of bpcConfig.pipelineSequence) {
     try {
       if (signal?.aborted) break;
-      const html = await tierFn(targetUrl, bpcConfig, signal, effectiveStripImages);
-      articleCache.set(cacheKey, html);
-      return html;
+      const article = await tierFn(targetUrl, bpcConfig, signal, effectiveStripImages);
+      articleCache.set(cacheKey, article);
+      return article;
     } catch (err) {
       if (debug) {
         console.error(`[DEBUG] [${bpcConfig.hostname}] [${tierFn.name}] Failed: ${err.message}`);
@@ -567,7 +686,6 @@ async function executePipeline(targetUrl, signal, stripImages = false, debug = f
     }
   }
 
-  // Only write to errorCache if the failure was not due to an abort signal
   if (!signal?.aborted) {
     errorCache.set(cacheKey, true);
   }
@@ -591,8 +709,6 @@ app.get('/', (req, res) => {
 });
 
 app.get('/extract', async (req, res) => {
-  res.set('Content-Type', 'text/html; charset=utf-8');
-
   const rawUrl = req.query.url;
   if (!rawUrl) return res.status(400).send('Missing url parameter');
 
@@ -601,13 +717,31 @@ app.get('/extract', async (req, res) => {
 
   const stripImages = req.query.no_images === 'true' || req.query.no_images === '1';
   const debug = req.query.debug === 'true' || req.query.debug === '1';
+  const format = req.query.format || 'html';
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 30000);
 
   try {
-    const result = await executePipeline(targetUrl, controller.signal, stripImages, debug);
-    return res.send(result);
+    const article = await executePipeline(targetUrl, controller.signal, stripImages, debug);
+
+    if (format === 'epub') {
+      const epubBuffer = await buildEpub(article.title, article.content, targetUrl, stripImages);
+      res.set('Content-Type', 'application/epub+zip');
+      res.set('Content-Disposition', `attachment; filename="${(article.title || 'article').replace(/[^a-z0-9]/gi, '_').slice(0, 60)}.epub"`);
+      return res.send(epubBuffer);
+    }
+
+    if (format === 'quickrss') {
+      const html = buildQuickRSSHTML(article.title, article.content, targetUrl, stripImages);
+      res.set('Content-Type', 'text/html; charset=utf-8');
+      return res.send(html);
+    }
+
+    const html = buildKindleHTML(article.title, article.content, targetUrl, stripImages);
+    res.set('Content-Type', 'text/html; charset=utf-8');
+    return res.send(html);
+
   } catch (err) {
     if (debug) {
       console.error(`[EXTRACTION FAILED] Domain: ${targetUrl} | Reason: ${err.message}`);
