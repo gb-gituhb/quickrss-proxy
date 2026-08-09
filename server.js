@@ -99,55 +99,84 @@ function isJsAppShell(rawHtml) {
     return textOnly.length < 150;
 }
 
-// Cleans inline styles, strips active tags/embeds, and updates image sources
-function sanitizeContent(htmlContent, targetUrl) {
+// Cleans inline styles, active tags, and handles strict image caps/stripping
+function sanitizeContent(htmlContent, targetUrl, stripAllImages = false) {
     if (!htmlContent) return '';
     let dom = null;
     try {
         dom = parseHTML(`<div>${htmlContent}</div>`);
         const doc = dom.window.document;
 
-        // Strip scripts, inline styles, embeds, and forms
-        const badTags = doc.querySelectorAll('script, style, iframe, object, embed, form, noscript');
+        // 1. Purge active, styling, and embedded components that stall E-ink parsers
+        const badTags = doc.querySelectorAll('script, style, iframe, object, embed, form, noscript, svg, canvas, source');
         badTags.forEach(el => el.remove());
 
-        // Remove inline style attributes that break E-ink layout/fonts
+        // 2. Strip inline style attributes
         const styledElements = doc.querySelectorAll('[style]');
         styledElements.forEach(el => el.removeAttribute('style'));
 
-        // Fix image paths
         const imgs = doc.querySelectorAll('img');
-        imgs.forEach(img => {
-            const realSrc = img.getAttribute('data-src') || 
-                            img.getAttribute('data-original') || 
-                            img.getAttribute('data-lazy-src') || 
-                            img.getAttribute('src');
 
-            if (!realSrc || realSrc.startsWith('data:')) {
-                img.remove();
-                return;
-            }
+        if (stripAllImages) {
+            imgs.forEach(img => img.remove());
+        } else {
+            let imageCount = 0;
+            const MAX_IMAGES = 5; // Strict cap per article to prevent sync hangs
 
-            const width = img.getAttribute('width');
-            const height = img.getAttribute('height');
-            if ((width === '1' || width === '0') && (height === '1' || height === '0')) {
-                img.remove();
-                return;
-            }
+            imgs.forEach(img => {
+                if (imageCount >= MAX_IMAGES) {
+                    img.remove();
+                    return;
+                }
 
-            try {
-                const absUrl = new URL(realSrc, targetUrl).href;
-                img.setAttribute('src', absUrl);
-            } catch (_) {
-                img.remove();
-                return;
-            }
+                const realSrc = img.getAttribute('data-src') || 
+                                img.getAttribute('data-original') || 
+                                img.getAttribute('data-lazy-src') || 
+                                img.getAttribute('src');
 
-            img.removeAttribute('data-src');
-            img.removeAttribute('data-original');
-            img.removeAttribute('data-lazy-src');
-            img.removeAttribute('srcset');
-        });
+                if (!realSrc || realSrc.startsWith('data:') || realSrc.includes('tracking') || realSrc.includes('pixel')) {
+                    img.remove();
+                    return;
+                }
+
+                const width = img.getAttribute('width');
+                const height = img.getAttribute('height');
+                if ((width === '1' || width === '0') && (height === '1' || height === '0')) {
+                    img.remove();
+                    return;
+                }
+
+                try {
+                    const absUrl = new URL(realSrc, targetUrl).href;
+                    if (!absUrl.startsWith('http://') && !absUrl.startsWith('https://')) {
+                        img.remove();
+                        return;
+                    }
+                    img.setAttribute('src', absUrl);
+                    imageCount++;
+                } catch (_) {
+                    img.remove();
+                    return;
+                }
+
+                // Remove attributes causing duplicate/unsupported requests on e-readers
+                img.removeAttribute('data-src');
+                img.removeAttribute('data-original');
+                img.removeAttribute('data-lazy-src');
+                img.removeAttribute('srcset');
+                img.removeAttribute('loading');
+                img.removeAttribute('decoding');
+                img.removeAttribute('sizes');
+            });
+
+            // Flatten <picture> elements into plain <img> tags
+            const pictures = doc.querySelectorAll('picture');
+            pictures.forEach(pic => {
+                const img = pic.querySelector('img');
+                if (img) pic.replaceWith(img);
+                else pic.remove();
+            });
+        }
 
         return doc.body.firstElementChild ? doc.body.firstElementChild.innerHTML : htmlContent;
     } catch (e) {
@@ -160,8 +189,8 @@ function sanitizeContent(htmlContent, targetUrl) {
     }
 }
 
-function buildKindleHTML(title, content, targetUrl = '') {
-    const cleanedContent = targetUrl ? sanitizeContent(content, targetUrl) : content;
+function buildKindleHTML(title, content, targetUrl = '', stripAllImages = false) {
+    const cleanedContent = targetUrl ? sanitizeContent(content, targetUrl, stripAllImages) : content;
     const safeTitle = escapeHtml(title || 'Untitled');
 
     return `<!DOCTYPE html>
@@ -214,7 +243,7 @@ function getCombinedSignal(timeoutMs, parentSignal) {
     return timeoutSignal;
 }
 
-// Universal Content Quality Gate
+// Quality Assurance Gate
 function isValidContent(htmlContent) {
     if (!htmlContent) return false;
 
@@ -245,13 +274,13 @@ function isValidContent(htmlContent) {
         return false;
     }
 
-    // 3. Absolute Minimum Word Threshold (200 words)
+    // 3. Minimum Content Threshold
     const paragraphCount = (scanWindow.match(/<p[\s>]/gi) || []).length;
     return !(wordCount < 200 || paragraphCount < 2);
 }
 
 // Tier 1: Direct Fetch (2.5s)
-async function fetchDirect(targetUrl, parentSignal) {
+async function fetchDirect(targetUrl, parentSignal, stripImages = false) {
     let dom = null;
     try {
         const response = await fetch(targetUrl, {
@@ -285,7 +314,7 @@ async function fetchDirect(targetUrl, parentSignal) {
         if (!article || !article.content || !isValidContent(article.content)) {
             throw new Error('Tier 1 content invalid or incomplete');
         }
-        return buildKindleHTML(article.title, article.content, targetUrl);
+        return buildKindleHTML(article.title, article.content, targetUrl, stripImages);
     } finally {
         if (dom && dom.window && typeof dom.window.close === 'function') {
             dom.window.close();
@@ -295,7 +324,7 @@ async function fetchDirect(targetUrl, parentSignal) {
 }
 
 // Tier 2: Jina AI Middleware (5.0s)
-async function fetchViaLiveMiddleware(targetUrl, parentSignal) {
+async function fetchViaLiveMiddleware(targetUrl, parentSignal, stripImages = false) {
     const response = await fetch(`https://r.jina.ai/${targetUrl}`, {
         headers: getJinaHeaders(),
         signal: getCombinedSignal(5000, parentSignal)
@@ -308,11 +337,11 @@ async function fetchViaLiveMiddleware(targetUrl, parentSignal) {
     const htmlContent = await marked.parse(json.data.content);
     if (!isValidContent(htmlContent)) throw new Error('Jina Live content invalid or paywalled');
 
-    return buildKindleHTML(json.data.title || 'Article', htmlContent, targetUrl);
+    return buildKindleHTML(json.data.title || 'Article', htmlContent, targetUrl, stripImages);
 }
 
 // Tier 3: archive.ph (5.5s)
-async function fetchViaArchivePh(targetUrl, parentSignal) {
+async function fetchViaArchivePh(targetUrl, parentSignal, stripImages = false) {
     const archivePhUrl = `https://archive.ph/newest/${targetUrl}`;
     const response = await fetch(`https://r.jina.ai/${archivePhUrl}`, {
         headers: getJinaHeaders(),
@@ -326,11 +355,11 @@ async function fetchViaArchivePh(targetUrl, parentSignal) {
     const htmlContent = await marked.parse(json.data.content);
     if (!isValidContent(htmlContent)) throw new Error('archive.ph snapshot not found or blocked');
 
-    return buildKindleHTML(json.data.title || 'Archived Article', htmlContent, targetUrl);
+    return buildKindleHTML(json.data.title || 'Archived Article', htmlContent, targetUrl, stripImages);
 }
 
 // Tier 4: Wayback Machine (4.0s)
-async function fetchViaWayback(targetUrl, parentSignal) {
+async function fetchViaWayback(targetUrl, parentSignal, stripImages = false) {
     const apiRes = await fetch(`https://archive.org/wayback/available?url=${encodeURIComponent(targetUrl)}`, {
         signal: getCombinedSignal(4000, parentSignal)
     });
@@ -340,15 +369,16 @@ async function fetchViaWayback(targetUrl, parentSignal) {
     const snapshotUrl = apiData?.archived_snapshots?.closest?.url;
     if (!snapshotUrl) throw new Error('No Wayback snapshot available');
 
-    return await fetchDirect(snapshotUrl, parentSignal);
+    return await fetchDirect(snapshotUrl, parentSignal, stripImages);
 }
 
 // Pipeline Execution
-async function executePipeline(targetUrl, signal) {
-    const cachedHtml = articleCache.get(targetUrl);
+async function executePipeline(targetUrl, signal, stripImages = false) {
+    const cacheKey = stripImages ? `${targetUrl}#no_img` : targetUrl;
+    const cachedHtml = articleCache.get(cacheKey);
     if (cachedHtml) return cachedHtml;
 
-    if (errorCache.get(targetUrl)) {
+    if (errorCache.get(cacheKey)) {
         throw new Error('Recent extraction failure (cached error)');
     }
 
@@ -357,15 +387,15 @@ async function executePipeline(targetUrl, signal) {
     for (const tierFn of pipeline) {
         try {
             if (signal?.aborted) break;
-            const html = await tierFn(targetUrl, signal);
-            articleCache.set(targetUrl, html);
+            const html = await tierFn(targetUrl, signal, stripImages);
+            articleCache.set(cacheKey, html);
             return html;
         } catch (_) {
             continue;
         }
     }
 
-    errorCache.set(targetUrl, true);
+    errorCache.set(cacheKey, true);
     throw new Error('Failed to extract article content across all pipelines.');
 }
 
@@ -380,11 +410,13 @@ app.get('/extract', async (req, res) => {
     const targetUrl = sanitizeUrl(rawUrl);
     if (!targetUrl) return res.status(400).send('Invalid URL provided.');
 
+    const stripImages = req.query.no_images === 'true' || req.query.no_images === '1';
+
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 18000); // 18s global ceiling
+    const timeout = setTimeout(() => controller.abort(), 18000); // 18s global budget
 
     try {
-        const result = await executePipeline(targetUrl, controller.signal);
+        const result = await executePipeline(targetUrl, controller.signal, stripImages);
         return res.send(result);
     } catch (err) {
         if (controller.signal.aborted) {
