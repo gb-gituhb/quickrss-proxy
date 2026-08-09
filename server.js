@@ -44,7 +44,7 @@ function buildKindleHTML(title, content) {
 </html>`;
 }
 
-// Tier 1: Direct Fetch + Readability
+// Tier 1: Direct Fetch + Readability (Original Site)
 async function fetchDirect(targetUrl) {
     const response = await fetch(targetUrl, {
         headers: {
@@ -58,7 +58,6 @@ async function fetchDirect(targetUrl) {
     const dom = parseHTML(html);
     const doc = dom.window.document;
 
-    // Fix relative image and link paths
     const base = doc.createElement('base');
     base.href = targetUrl;
     doc.head.appendChild(base);
@@ -73,7 +72,26 @@ async function fetchDirect(targetUrl) {
     return buildKindleHTML(article.title, article.content);
 }
 
-// Tier 2: Anti-Bot Middleware (Bypasses Paywalls & Cloudflare CAPTCHAs)
+// Tier 2: Fetch archive.ph Snapshot via Anti-CAPTCHA Middleware
+async function fetchViaArchivePh(targetUrl) {
+    // Queries archive.ph for the latest archived snapshot of the target URL
+    const archivePhUrl = `https://archive.ph/newest/${targetUrl}`;
+    const middlewareUrl = `https://r.jina.ai/${archivePhUrl}`;
+
+    const response = await fetch(middlewareUrl, {
+        headers: { 'Accept': 'application/json' }
+    });
+
+    if (!response.ok) throw new Error(`archive.ph Middleware Error ${response.status}`);
+    const json = await response.json();
+
+    if (!json.data || !json.data.content) throw new Error('archive.ph snapshot payload empty');
+
+    const htmlContent = await marked.parse(json.data.content);
+    return buildKindleHTML(json.data.title || 'Archive.ph Snapshot', htmlContent);
+}
+
+// Tier 3: Direct Anti-Bot Middleware (Bypasses Live Paywall if archive.ph lacks a snapshot)
 async function fetchViaMiddleware(targetUrl) {
     const middlewareUrl = `https://r.jina.ai/${targetUrl}`;
     const response = await fetch(middlewareUrl, {
@@ -85,19 +103,18 @@ async function fetchViaMiddleware(targetUrl) {
 
     if (!json.data || !json.data.content) throw new Error('Middleware payload empty');
 
-    // Convert markdown content to clean HTML safely
     const htmlContent = await marked.parse(json.data.content);
     return buildKindleHTML(json.data.title || 'Article', htmlContent);
 }
 
-// Tier 3: Internet Archive / Wayback Machine Fallback
+// Tier 4: Wayback Machine Fallback
 async function fetchViaWayback(targetUrl) {
     const archiveApi = `https://archive.org/wayback/available?url=${encodeURIComponent(targetUrl)}`;
     const apiRes = await fetch(archiveApi);
     const apiData = await apiRes.json();
 
     const snapshotUrl = apiData?.archived_snapshots?.closest?.url;
-    if (!snapshotUrl) throw new Error('No archived snapshot available');
+    if (!snapshotUrl) throw new Error('No Wayback snapshot available');
 
     return await fetchDirect(snapshotUrl);
 }
@@ -107,28 +124,36 @@ app.get('/extract', async (req, res) => {
     const targetUrl = req.query.url;
     if (!targetUrl) return res.status(400).send('Missing url parameter');
 
-    // Attempt 1: Direct Fetch
+    // Attempt 1: Direct Fetch from Original Source
     try {
         const html = await fetchDirect(targetUrl);
         return res.send(html);
     } catch (err) {
-        console.warn(`[Tier 1 Failed] ${targetUrl}: ${err.message}. Trying Tier 2 Middleware...`);
+        console.warn(`[Tier 1 Failed] ${targetUrl}: ${err.message}. Trying Tier 2 (archive.ph via Middleware)...`);
     }
 
-    // Attempt 2: Anti-Bot Middleware (Paywall & Cloudflare Bypass)
+    // Attempt 2: archive.ph Snapshot (routed via Middleware to bypass CAPTCHA)
+    try {
+        const html = await fetchViaArchivePh(targetUrl);
+        return res.send(html);
+    } catch (err) {
+        console.warn(`[Tier 2 Failed] ${targetUrl}: ${err.message}. Trying Tier 3 (Live Middleware)...`);
+    }
+
+    // Attempt 3: Live Page Extraction via Middleware
     try {
         const html = await fetchViaMiddleware(targetUrl);
         return res.send(html);
     } catch (err) {
-        console.warn(`[Tier 2 Failed] ${targetUrl}: ${err.message}. Trying Tier 3 Wayback Archive...`);
+        console.warn(`[Tier 3 Failed] ${targetUrl}: ${err.message}. Trying Tier 4 (Wayback Archive)...`);
     }
 
-    // Attempt 3: Wayback Archive
+    // Attempt 4: Wayback Archive Fallback
     try {
         const html = await fetchViaWayback(targetUrl);
         return res.send(html);
     } catch (err) {
-        console.error(`[Tier 3 Failed] ${targetUrl}: ${err.message}`);
+        console.error(`[Tier 4 Failed] ${targetUrl}: ${err.message}`);
         return res.status(500).send('Failed to extract article content across all pipelines.');
     }
 });
