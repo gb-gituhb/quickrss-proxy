@@ -85,8 +85,21 @@ function sanitizeUrl(rawUrl) {
     return null;
 }
 
+// Strictly detects raw HTML that is a JS SPA shell, cookie consent banner, or paywall wrapper
 function isJsAppShell(rawHtml) {
     if (!rawHtml) return true;
+    const lower = rawHtml.toLowerCase();
+
+    // Rejects common JS consent/app shell wrappers seen on Guardian, BBC, and top news sites
+    const shellIndicators = [
+        'gu-cmp-v2', 'guardian-page-skin', 'bbc-privacy-banner', 
+        'consent-banner', 'sp_message_container', 'js-article-body',
+        'enable javascript to view', 'please turn on javascript'
+    ];
+    if (shellIndicators.some(indicator => lower.includes(indicator))) {
+        return true;
+    }
+
     const stripped = rawHtml
         .replace(/<script[\s\S]*?<\/script>/gi, '')
         .replace(/<style[\s\S]*?<\/style>/gi, '')
@@ -96,10 +109,9 @@ function isJsAppShell(rawHtml) {
     const bodyContent = bodyMatch ? bodyMatch[1] : stripped;
     const textOnly = bodyContent.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
 
-    return textOnly.length < 150;
+    return textOnly.length < 250;
 }
 
-// Cleans inline styles, active tags, and handles strict image caps/stripping
 function sanitizeContent(htmlContent, targetUrl, stripAllImages = false) {
     if (!htmlContent) return '';
     let dom = null;
@@ -107,7 +119,7 @@ function sanitizeContent(htmlContent, targetUrl, stripAllImages = false) {
         dom = parseHTML(`<div>${htmlContent}</div>`);
         const doc = dom.window.document;
 
-        // 1. Purge active, styling, and embedded components that stall E-ink parsers
+        // 1. Purge active elements, style blocks, and tracker tags
         const badTags = doc.querySelectorAll('script, style, iframe, object, embed, form, noscript, svg, canvas, source');
         badTags.forEach(el => el.remove());
 
@@ -121,7 +133,7 @@ function sanitizeContent(htmlContent, targetUrl, stripAllImages = false) {
             imgs.forEach(img => img.remove());
         } else {
             let imageCount = 0;
-            const MAX_IMAGES = 5; // Strict cap per article to prevent sync hangs
+            const MAX_IMAGES = 5;
 
             imgs.forEach(img => {
                 if (imageCount >= MAX_IMAGES) {
@@ -159,7 +171,6 @@ function sanitizeContent(htmlContent, targetUrl, stripAllImages = false) {
                     return;
                 }
 
-                // Remove attributes causing duplicate/unsupported requests on e-readers
                 img.removeAttribute('data-src');
                 img.removeAttribute('data-original');
                 img.removeAttribute('data-lazy-src');
@@ -169,7 +180,6 @@ function sanitizeContent(htmlContent, targetUrl, stripAllImages = false) {
                 img.removeAttribute('sizes');
             });
 
-            // Flatten <picture> elements into plain <img> tags
             const pictures = doc.querySelectorAll('picture');
             pictures.forEach(pic => {
                 const img = pic.querySelector('img');
@@ -201,23 +211,23 @@ function buildKindleHTML(title, content, targetUrl = '', stripAllImages = false)
     <title>${safeTitle}</title>
     <style>
         @font-face { font-family: 'Charis SIL'; src: local('Charis SIL'); }
-        html { font-size: 18px; }
+        html { font-size: 20px; }
         body {
             font-family: 'Charis SIL', Georgia, serif;
             line-height: 1.6;
             color: #000;
             background-color: #fff;
             margin: 0 auto;
-            padding: 12px;
-            font-size: 1rem;
+            padding: 14px;
+            font-size: 1.25rem; /* ~25px base font size for ultra-legible E-ink reading */
             word-wrap: break-word;
         }
-        h1 { font-size: 1.6rem; line-height: 1.3; margin-bottom: 0.4rem; }
-        img { max-width: 100% !important; height: auto !important; display: block; margin: 15px auto; }
-        p { margin-bottom: 1.2rem; text-align: justify; font-size: 1rem; }
+        h1 { font-size: 2rem; line-height: 1.25; margin-bottom: 0.6rem; font-weight: bold; }
+        img { max-width: 100% !important; height: auto !important; display: block; margin: 18px auto; }
+        p { margin-bottom: 1.4rem; text-align: justify; font-size: 1.25rem; }
         a { color: #000; text-decoration: underline; }
-        blockquote { border-left: 3px solid #000; padding-left: 12px; margin-left: 0; }
-        pre, code { font-family: monospace; font-size: 0.9rem; white-space: pre-wrap; }
+        blockquote { border-left: 4px solid #000; padding-left: 14px; margin-left: 0; font-style: italic; }
+        pre, code { font-family: monospace; font-size: 1.1rem; white-space: pre-wrap; }
     </style>
 </head>
 <body>
@@ -243,7 +253,6 @@ function getCombinedSignal(timeoutMs, parentSignal) {
     return timeoutSignal;
 }
 
-// Quality Assurance Gate
 function isValidContent(htmlContent) {
     if (!htmlContent) return false;
 
@@ -251,7 +260,7 @@ function isValidContent(htmlContent) {
     const plainText = scanWindow.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
     const lower = plainText.toLowerCase();
     
-    // 1. Anti-bot / Captcha rejection
+    // 1. Hard error / Captcha rejection
     const hardErrors = [
         'captcha', 'enable javascript', 'access denied', 
         'security check', 'just a moment...', 'pardon our interruption',
@@ -276,7 +285,7 @@ function isValidContent(htmlContent) {
 
     // 3. Minimum Content Threshold
     const paragraphCount = (scanWindow.match(/<p[\s>]/gi) || []).length;
-    return !(wordCount < 200 || paragraphCount < 2);
+    return !(wordCount < 250 || paragraphCount < 2);
 }
 
 // Tier 1: Direct Fetch (2.5s)
@@ -295,7 +304,7 @@ async function fetchDirect(targetUrl, parentSignal, stripImages = false) {
         const html = await response.text();
 
         if (isJsAppShell(html)) {
-            throw new Error('Raw HTML is an unrendered JS application shell');
+            throw new Error('Raw HTML is a JS application shell or consent banner');
         }
 
         dom = parseHTML(html);
@@ -413,7 +422,7 @@ app.get('/extract', async (req, res) => {
     const stripImages = req.query.no_images === 'true' || req.query.no_images === '1';
 
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 18000); // 18s global budget
+    const timeout = setTimeout(() => controller.abort(), 18000);
 
     try {
         const result = await executePipeline(targetUrl, controller.signal, stripImages);
